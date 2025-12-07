@@ -1,0 +1,7 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+*md
+**/*.md
+cblas.h
+src/util/packing.zig
