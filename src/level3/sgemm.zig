@@ -16,6 +16,7 @@ const packing = @import("../util/packing.zig");
 // Select micro-kernel based on architecture
 const micro_kernel = switch (builtin.cpu.arch) {
     .x86_64 => @import("../kernel/x86_64/sgemm_kernel_8x8.zig"),
+    .aarch64 => @import("../kernel/arm64/sgemm_kernel_8x8.zig"),
     else => @import("../kernel/generic/sgemm_kernel_4x4.zig"),
 };
 
