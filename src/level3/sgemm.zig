@@ -81,6 +81,13 @@ inline fn sgemmDirect(
     alpha: f32,
     beta: f32,
 ) void {
+    // FAST PATH: alpha=1.0, beta=0.0 (common in inference)
+    // Avoids read-modify-write, just direct stores
+    if (alpha == 1.0 and beta == 0.0) {
+        sgemmDirectFast(M, N, K, A, lda, B, ldb, C, ldc);
+        return;
+    }
+
     const VEC_WIDTH = 8;
     const Vec = @Vector(VEC_WIDTH, f32);
 
@@ -255,6 +262,149 @@ inline fn sgemmDirect(
                 c0 += A[i * lda + kk] * B[kk * ldb + j];
             }
             C[i * ldc + j] += alpha * c0;
+        }
+    }
+}
+
+/// Fast path SGEMM for alpha=1.0, beta=0.0 (inference workloads)
+/// Direct stores without read-modify-write - significantly faster for memory-bound ops
+inline fn sgemmDirectFast(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+) void {
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    const MR = 4;
+    const NR = 24;
+
+    var i: usize = 0;
+    while (i + MR <= M) : (i += MR) {
+        var j: usize = 0;
+
+        // Main loop: 4x24 tiles
+        while (j + NR <= N) : (j += NR) {
+            var c00: Vec = @splat(0.0);
+            var c01: Vec = @splat(0.0);
+            var c02: Vec = @splat(0.0);
+            var c10: Vec = @splat(0.0);
+            var c11: Vec = @splat(0.0);
+            var c12: Vec = @splat(0.0);
+            var c20: Vec = @splat(0.0);
+            var c21: Vec = @splat(0.0);
+            var c22: Vec = @splat(0.0);
+            var c30: Vec = @splat(0.0);
+            var c31: Vec = @splat(0.0);
+            var c32: Vec = @splat(0.0);
+
+            for (0..K) |kk| {
+                const a0: Vec = @splat(A[(i + 0) * lda + kk]);
+                const a1: Vec = @splat(A[(i + 1) * lda + kk]);
+                const a2: Vec = @splat(A[(i + 2) * lda + kk]);
+                const a3: Vec = @splat(A[(i + 3) * lda + kk]);
+
+                const b_base = kk * ldb + j;
+                const b0: Vec = B[b_base ..][0..VEC_WIDTH].*;
+                const b1: Vec = B[b_base + VEC_WIDTH ..][0..VEC_WIDTH].*;
+                const b2: Vec = B[b_base + 2 * VEC_WIDTH ..][0..VEC_WIDTH].*;
+
+                c00 += a0 * b0;
+                c01 += a0 * b1;
+                c02 += a0 * b2;
+                c10 += a1 * b0;
+                c11 += a1 * b1;
+                c12 += a1 * b2;
+                c20 += a2 * b0;
+                c21 += a2 * b1;
+                c22 += a2 * b2;
+                c30 += a3 * b0;
+                c31 += a3 * b1;
+                c32 += a3 * b2;
+            }
+
+            // FAST: Direct store without read (no alpha multiply, no add to existing C)
+            C[(i + 0) * ldc + j ..][0..VEC_WIDTH].* = c00;
+            C[(i + 0) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c01;
+            C[(i + 0) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c02;
+            C[(i + 1) * ldc + j ..][0..VEC_WIDTH].* = c10;
+            C[(i + 1) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c11;
+            C[(i + 1) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c12;
+            C[(i + 2) * ldc + j ..][0..VEC_WIDTH].* = c20;
+            C[(i + 2) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c21;
+            C[(i + 2) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c22;
+            C[(i + 3) * ldc + j ..][0..VEC_WIDTH].* = c30;
+            C[(i + 3) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = c31;
+            C[(i + 3) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = c32;
+        }
+
+        // Handle remaining columns (8 at a time)
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            var c0: Vec = @splat(0.0);
+            var c1: Vec = @splat(0.0);
+            var c2: Vec = @splat(0.0);
+            var c3: Vec = @splat(0.0);
+
+            for (0..K) |kk| {
+                const b_vec: Vec = B[kk * ldb + j ..][0..VEC_WIDTH].*;
+                c0 += @as(Vec, @splat(A[(i + 0) * lda + kk])) * b_vec;
+                c1 += @as(Vec, @splat(A[(i + 1) * lda + kk])) * b_vec;
+                c2 += @as(Vec, @splat(A[(i + 2) * lda + kk])) * b_vec;
+                c3 += @as(Vec, @splat(A[(i + 3) * lda + kk])) * b_vec;
+            }
+
+            C[(i + 0) * ldc + j ..][0..VEC_WIDTH].* = c0;
+            C[(i + 1) * ldc + j ..][0..VEC_WIDTH].* = c1;
+            C[(i + 2) * ldc + j ..][0..VEC_WIDTH].* = c2;
+            C[(i + 3) * ldc + j ..][0..VEC_WIDTH].* = c3;
+        }
+
+        // Scalar tail
+        while (j < N) : (j += 1) {
+            var c0: f32 = 0.0;
+            var c1: f32 = 0.0;
+            var c2: f32 = 0.0;
+            var c3: f32 = 0.0;
+            for (0..K) |kk| {
+                const b_val = B[kk * ldb + j];
+                c0 += A[(i + 0) * lda + kk] * b_val;
+                c1 += A[(i + 1) * lda + kk] * b_val;
+                c2 += A[(i + 2) * lda + kk] * b_val;
+                c3 += A[(i + 3) * lda + kk] * b_val;
+            }
+            C[(i + 0) * ldc + j] = c0;
+            C[(i + 1) * ldc + j] = c1;
+            C[(i + 2) * ldc + j] = c2;
+            C[(i + 3) * ldc + j] = c3;
+        }
+    }
+
+    // Handle remaining rows (< 4)
+    while (i < M) : (i += 1) {
+        var j: usize = 0;
+
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            var c0: Vec = @splat(0.0);
+            for (0..K) |kk| {
+                const a_val: Vec = @splat(A[i * lda + kk]);
+                const b_vec: Vec = B[kk * ldb + j ..][0..VEC_WIDTH].*;
+                c0 += a_val * b_vec;
+            }
+            C[i * ldc + j ..][0..VEC_WIDTH].* = c0;
+        }
+
+        while (j < N) : (j += 1) {
+            var c0: f32 = 0.0;
+            for (0..K) |kk| {
+                c0 += A[i * lda + kk] * B[kk * ldb + j];
+            }
+            C[i * ldc + j] = c0;
         }
     }
 }

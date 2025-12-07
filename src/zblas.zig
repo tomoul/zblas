@@ -16,8 +16,8 @@ pub const config = @import("config.zig");
 pub const reference = @import("reference.zig");
 
 // Import optimized implementations
-// TODO: These will be replaced with optimized versions in later phases
 const sgemm_impl = @import("level3/sgemm.zig");
+const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
 
 // ============================================================================
@@ -98,6 +98,122 @@ pub fn sgemmTranspose(
 ) void {
     sgemm_impl.sgemmTranspose(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
 }
+
+// ============================================================================
+// Parallel SGEMM (Phase 6)
+// ============================================================================
+
+/// Parallel SGEMM with automatic thread count selection.
+///
+/// Automatically determines optimal thread count based on problem size.
+/// Falls back to single-threaded for small matrices where threading hurts.
+///
+/// IMPORTANT: Based on Phase 5 benchmarks, multi-threading only helps for
+/// large matrices (>50M FLOPS, >512 rows). For typical AI inference with
+/// many small matmuls, single-threaded is often faster!
+///
+/// Parameters:
+///   - allocator: Memory allocator for packing buffers
+///   - M, N, K: Matrix dimensions (A is MxK, B is KxN, C is MxN)
+///   - A, B: Input matrices in row-major order
+///   - C: Output matrix in row-major order
+///   - alpha, beta: Scalar multipliers
+pub fn sgemmParallel(
+    allocator: std.mem.Allocator,
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B: []const f32,
+    C: []f32,
+    alpha: f32,
+    beta: f32,
+) !void {
+    try sgemm_parallel_impl.sgemmParallelAuto(allocator, M, N, K, A, B, C, alpha, beta);
+}
+
+/// Parallel SGEMM with explicit thread count.
+///
+/// Use this when you want to control threading explicitly.
+/// Thread count will be automatically reduced if the problem is too small.
+pub fn sgemmParallelN(
+    allocator: std.mem.Allocator,
+    num_threads: usize,
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B: []const f32,
+    C: []f32,
+    alpha: f32,
+    beta: f32,
+) !void {
+    try sgemm_parallel_impl.sgemmParallel(allocator, num_threads, M, N, K, A, K, B, N, C, N, alpha, beta);
+}
+
+/// Check if a matrix size should use parallel execution.
+/// Returns false for small/medium matrices where threading hurts performance.
+pub fn shouldParallelize(M: usize, N: usize, K: usize) bool {
+    return sgemm_parallel_impl.shouldParallelize(M, N, K);
+}
+
+/// Get optimal thread count for given matrix dimensions.
+/// Returns 1 for small matrices, more for large matrices.
+pub fn getOptimalThreadCount(M: usize, N: usize, K: usize) usize {
+    return sgemm_parallel_impl.getOptimalThreadCount(M, N, K);
+}
+
+// ============================================================================
+// Context-based API (Tomoul integration)
+// ============================================================================
+
+/// Context for zblas operations with threading configuration.
+/// Compatible with Tomoul's Context struct.
+pub const Context = struct {
+    num_threads: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, num_threads: usize) Context {
+        return .{
+            .num_threads = num_threads,
+            .allocator = allocator,
+        };
+    }
+
+    /// SGEMM using this context's threading configuration.
+    /// Automatically uses parallel path for large matrices if num_threads > 1.
+    pub fn sgemm(
+        ctx: *const Context,
+        M: usize,
+        N: usize,
+        K: usize,
+        A: []const f32,
+        B: []const f32,
+        C: []f32,
+        alpha: f32,
+        beta: f32,
+    ) !void {
+        if (ctx.num_threads > 1 and sgemm_parallel_impl.shouldParallelize(M, N, K)) {
+            try sgemm_parallel_impl.sgemmParallel(
+                ctx.allocator,
+                ctx.num_threads,
+                M,
+                N,
+                K,
+                A,
+                K,
+                B,
+                N,
+                C,
+                N,
+                alpha,
+                beta,
+            );
+        } else {
+            sgemm_impl.sgemm(M, N, K, A, B, C, alpha, beta);
+        }
+    }
+};
 
 // ============================================================================
 // Level 2 BLAS (Matrix-Vector Operations)

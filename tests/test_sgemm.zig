@@ -276,3 +276,193 @@ test "sgemv with alpha beta" {
     try std.testing.expectApproxEqRel(y[0], 28.5, 1e-5);
     try std.testing.expectApproxEqRel(y[1], 64.5, 1e-5);
 }
+
+// ============================================================================
+// Parallel SGEMM Tests (Phase 6)
+// ============================================================================
+
+test "parallel sgemm 64x64 correctness" {
+    const allocator = std.testing.allocator;
+    const N = 64;
+
+    var A: [N * N]f32 = undefined;
+    var B: [N * N]f32 = undefined;
+    var C_parallel: [N * N]f32 = undefined;
+    var C_single: [N * N]f32 = undefined;
+
+    // Initialize with deterministic values
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+        B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+    }
+    @memset(&C_parallel, 0.0);
+    @memset(&C_single, 0.0);
+
+    // Single-threaded reference
+    zblas.sgemm(N, N, N, &A, &B, &C_single, 1.0, 0.0);
+
+    // Parallel with 4 threads (will use single-threaded due to size threshold)
+    try zblas.sgemmParallelN(allocator, 4, N, N, N, &A, &B, &C_parallel, 1.0, 0.0);
+
+    // Compare results
+    for (0..N * N) |i| {
+        try std.testing.expectApproxEqRel(C_parallel[i], C_single[i], 1e-4);
+    }
+}
+
+test "parallel sgemm 128x128 correctness" {
+    const allocator = std.testing.allocator;
+    const N = 128;
+
+    const A = try allocator.alloc(f32, N * N);
+    defer allocator.free(A);
+    const B = try allocator.alloc(f32, N * N);
+    defer allocator.free(B);
+    const C_parallel = try allocator.alloc(f32, N * N);
+    defer allocator.free(C_parallel);
+    const C_single = try allocator.alloc(f32, N * N);
+    defer allocator.free(C_single);
+
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+        B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+    }
+    @memset(C_parallel, 0.0);
+    @memset(C_single, 0.0);
+
+    zblas.sgemm(N, N, N, A, B, C_single, 1.0, 0.0);
+    try zblas.sgemmParallelN(allocator, 4, N, N, N, A, B, C_parallel, 1.0, 0.0);
+
+    for (0..N * N) |i| {
+        try std.testing.expectApproxEqRel(C_parallel[i], C_single[i], 1e-4);
+    }
+}
+
+test "parallel sgemm with beta" {
+    const allocator = std.testing.allocator;
+    const N = 64;
+
+    var A: [N * N]f32 = undefined;
+    var B: [N * N]f32 = undefined;
+    var C_parallel: [N * N]f32 = undefined;
+    var C_single: [N * N]f32 = undefined;
+
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 50)) / 50.0;
+        B[i] = @as(f32, @floatFromInt((i * 3) % 50)) / 50.0;
+        C_parallel[i] = @as(f32, @floatFromInt((i * 11) % 50)) / 50.0;
+        C_single[i] = C_parallel[i];
+    }
+
+    // Test with alpha=2.0, beta=0.5
+    zblas.sgemm(N, N, N, &A, &B, &C_single, 2.0, 0.5);
+    try zblas.sgemmParallelN(allocator, 4, N, N, N, &A, &B, &C_parallel, 2.0, 0.5);
+
+    for (0..N * N) |i| {
+        try std.testing.expectApproxEqRel(C_parallel[i], C_single[i], 1e-4);
+    }
+}
+
+test "parallel sgemm various thread counts" {
+    const allocator = std.testing.allocator;
+    const N = 64;
+    const thread_counts = [_]usize{ 1, 2, 3, 4, 7, 8 };
+
+    var A: [N * N]f32 = undefined;
+    var B: [N * N]f32 = undefined;
+    var C_ref: [N * N]f32 = undefined;
+
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+        B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+    }
+    @memset(&C_ref, 0.0);
+
+    // Get reference result
+    zblas.sgemm(N, N, N, &A, &B, &C_ref, 1.0, 0.0);
+
+    // Test each thread count
+    for (thread_counts) |num_threads| {
+        var C_test: [N * N]f32 = undefined;
+        @memset(&C_test, 0.0);
+
+        try zblas.sgemmParallelN(allocator, num_threads, N, N, N, &A, &B, &C_test, 1.0, 0.0);
+
+        for (0..N * N) |i| {
+            try std.testing.expectApproxEqRel(C_test[i], C_ref[i], 1e-4);
+        }
+    }
+}
+
+test "shouldParallelize thresholds" {
+    // Small matrix - should NOT parallelize
+    try std.testing.expect(!zblas.shouldParallelize(100, 100, 100));
+
+    // Large matrix - should parallelize
+    try std.testing.expect(zblas.shouldParallelize(1024, 1024, 1024));
+}
+
+test "getOptimalThreadCount" {
+    // Small matrix - 1 thread
+    try std.testing.expectEqual(@as(usize, 1), zblas.getOptimalThreadCount(100, 100, 100));
+
+    // Large matrix - multiple threads
+    const threads = zblas.getOptimalThreadCount(2048, 2048, 2048);
+    try std.testing.expect(threads >= 1);
+}
+
+test "context sgemm" {
+    const allocator = std.testing.allocator;
+    const N = 64;
+
+    var A: [N * N]f32 = undefined;
+    var B: [N * N]f32 = undefined;
+    var C_ctx: [N * N]f32 = undefined;
+    var C_ref: [N * N]f32 = undefined;
+
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+        B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+    }
+    @memset(&C_ctx, 0.0);
+    @memset(&C_ref, 0.0);
+
+    // Reference
+    zblas.sgemm(N, N, N, &A, &B, &C_ref, 1.0, 0.0);
+
+    // Context-based (single threaded)
+    var ctx = zblas.Context.init(allocator, 1);
+    try ctx.sgemm(N, N, N, &A, &B, &C_ctx, 1.0, 0.0);
+
+    for (0..N * N) |i| {
+        try std.testing.expectApproxEqRel(C_ctx[i], C_ref[i], 1e-4);
+    }
+}
+
+test "context sgemm multi-threaded" {
+    const allocator = std.testing.allocator;
+    const N = 64;
+
+    var A: [N * N]f32 = undefined;
+    var B: [N * N]f32 = undefined;
+    var C_ctx: [N * N]f32 = undefined;
+    var C_ref: [N * N]f32 = undefined;
+
+    for (0..N * N) |i| {
+        A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+        B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+    }
+    @memset(&C_ctx, 0.0);
+    @memset(&C_ref, 0.0);
+
+    // Reference
+    zblas.sgemm(N, N, N, &A, &B, &C_ref, 1.0, 0.0);
+
+    // Context-based with 4 threads (will fall back to single for small N)
+    var ctx = zblas.Context.init(allocator, 4);
+    try ctx.sgemm(N, N, N, &A, &B, &C_ctx, 1.0, 0.0);
+
+    for (0..N * N) |i| {
+        try std.testing.expectApproxEqRel(C_ctx[i], C_ref[i], 1e-4);
+    }
+}

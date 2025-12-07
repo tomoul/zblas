@@ -79,3 +79,23 @@ pub fn getVectorWidth() usize {
         else => 1, // Scalar fallback
     };
 }
+
+/// Tile sizes struct for compile-time configuration
+pub const TileSizes = struct {
+    mc: usize,
+    kc: usize,
+    nc: usize,
+    mr: usize,
+    nr: usize,
+};
+
+/// Get tile sizes for current architecture (compile-time)
+pub fn getTileSizes() TileSizes {
+    return .{
+        .mc = MC,
+        .kc = KC,
+        .nc = NC,
+        .mr = MR,
+        .nr = NR,
+    };
+}
