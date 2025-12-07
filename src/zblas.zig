@@ -52,7 +52,7 @@ pub const Transpose = enum(c_int) {
 ///   - C: output matrix [M x N] in row-major order
 ///   - alpha: scalar multiplier for A*B (typically 1.0)
 ///   - beta: scalar multiplier for C (0.0 to overwrite, 1.0 to accumulate)
-pub fn sgemm(
+pub inline fn sgemm(
     M: usize,
     N: usize,
     K: usize,

@@ -20,12 +20,18 @@ const micro_kernel = switch (builtin.cpu.arch) {
     else => @import("../kernel/generic/sgemm_kernel_4x4.zig"),
 };
 
+// Fast 4x24 kernel for direct (non-packed) path on x86_64
+const fast_kernel = switch (builtin.cpu.arch) {
+    .x86_64 => @import("../kernel/x86_64/sgemm_kernel_4x24.zig"),
+    else => null,
+};
+
 // Re-export Transpose type from parent
 pub const Transpose = @import("../zblas.zig").Transpose;
 
 /// SGEMM: C = alpha * A * B + beta * C
 /// A is [M x K], B is [K x N], C is [M x N], all row-major
-pub fn sgemm(
+pub inline fn sgemm(
     M: usize,
     N: usize,
     K: usize,
@@ -41,15 +47,216 @@ pub fn sgemm(
     std.debug.assert(B.len >= K * N);
     std.debug.assert(C.len >= M * N);
 
-    // For now, use reference implementation
-    // TODO Phase 2: Add cache-blocked implementation with threshold
+    // Small matrices: use simple reference implementation
     if (M * N * K < config.MIN_OPTIMIZED_SIZE * config.MIN_OPTIMIZED_SIZE * config.MIN_OPTIMIZED_SIZE) {
         reference.sgemm_reference_simple(M, N, K, A, B, C, alpha, beta);
         return;
     }
 
-    // Use optimized path (currently just reference, will be replaced)
+    // Use direct SIMD path - simpler and usually faster for AI workloads
+    // The packed/blocked path is mainly useful for very large matrices (>2048)
+    // where cache reuse becomes critical
+    const max_dim = @max(M, @max(N, K));
+    if (max_dim <= 2048) {
+        sgemmDirect(M, N, K, A, K, B, N, C, N, alpha, beta);
+        return;
+    }
+
+    // Very large matrices: use cache-blocked implementation with packing
     sgemmOptimized(M, N, K, A, K, B, N, C, N, alpha, beta);
+}
+
+/// Direct SGEMM without packing - faster for medium matrices
+/// Uses 4x24 micro-kernel on x86_64, similar to Tomoul's ops.zig fallback
+inline fn sgemmDirect(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    const VEC_WIDTH = 8;
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    // Scale C by beta first
+    if (beta == 0.0) {
+        for (0..M) |i| {
+            @memset(C[i * ldc ..][0..N], 0.0);
+        }
+    } else if (beta != 1.0) {
+        const beta_vec: Vec = @splat(beta);
+        for (0..M) |i| {
+            var j: usize = 0;
+            while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+                const c_vec: Vec = C[i * ldc + j ..][0..VEC_WIDTH].*;
+                C[i * ldc + j ..][0..VEC_WIDTH].* = c_vec * beta_vec;
+            }
+            while (j < N) : (j += 1) {
+                C[i * ldc + j] *= beta;
+            }
+        }
+    }
+
+    if (alpha == 0.0) return;
+
+    // Process 4 rows at a time, 24 columns at a time (like Tomoul fallback)
+    const MR = 4;
+    const NR = 24;
+
+    var i: usize = 0;
+    while (i + MR <= M) : (i += MR) {
+        var j: usize = 0;
+
+        // Main loop: 4x24 tiles
+        while (j + NR <= N) : (j += NR) {
+            // Accumulators for 4x24 block (12 vectors)
+            var c00: Vec = @splat(0.0);
+            var c01: Vec = @splat(0.0);
+            var c02: Vec = @splat(0.0);
+            var c10: Vec = @splat(0.0);
+            var c11: Vec = @splat(0.0);
+            var c12: Vec = @splat(0.0);
+            var c20: Vec = @splat(0.0);
+            var c21: Vec = @splat(0.0);
+            var c22: Vec = @splat(0.0);
+            var c30: Vec = @splat(0.0);
+            var c31: Vec = @splat(0.0);
+            var c32: Vec = @splat(0.0);
+
+            // Reduction over K
+            for (0..K) |kk| {
+                // Broadcast A elements
+                const a0: Vec = @splat(A[(i + 0) * lda + kk]);
+                const a1: Vec = @splat(A[(i + 1) * lda + kk]);
+                const a2: Vec = @splat(A[(i + 2) * lda + kk]);
+                const a3: Vec = @splat(A[(i + 3) * lda + kk]);
+
+                // Load B vectors
+                const b_base = kk * ldb + j;
+                const b0: Vec = B[b_base ..][0..VEC_WIDTH].*;
+                const b1: Vec = B[b_base + VEC_WIDTH ..][0..VEC_WIDTH].*;
+                const b2: Vec = B[b_base + 2 * VEC_WIDTH ..][0..VEC_WIDTH].*;
+
+                // Accumulate
+                c00 += a0 * b0;
+                c01 += a0 * b1;
+                c02 += a0 * b2;
+                c10 += a1 * b0;
+                c11 += a1 * b1;
+                c12 += a1 * b2;
+                c20 += a2 * b0;
+                c21 += a2 * b1;
+                c22 += a2 * b2;
+                c30 += a3 * b0;
+                c31 += a3 * b1;
+                c32 += a3 * b2;
+            }
+
+            // Store with alpha scaling
+            const alpha_vec: Vec = @splat(alpha);
+            const c00_ptr = C[(i + 0) * ldc + j ..][0..VEC_WIDTH];
+            const c01_ptr = C[(i + 0) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH];
+            const c02_ptr = C[(i + 0) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH];
+            const c10_ptr = C[(i + 1) * ldc + j ..][0..VEC_WIDTH];
+            const c11_ptr = C[(i + 1) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH];
+            const c12_ptr = C[(i + 1) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH];
+            const c20_ptr = C[(i + 2) * ldc + j ..][0..VEC_WIDTH];
+            const c21_ptr = C[(i + 2) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH];
+            const c22_ptr = C[(i + 2) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH];
+            const c30_ptr = C[(i + 3) * ldc + j ..][0..VEC_WIDTH];
+            const c31_ptr = C[(i + 3) * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH];
+            const c32_ptr = C[(i + 3) * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH];
+
+            c00_ptr.* = @as(Vec, c00_ptr.*) + c00 * alpha_vec;
+            c01_ptr.* = @as(Vec, c01_ptr.*) + c01 * alpha_vec;
+            c02_ptr.* = @as(Vec, c02_ptr.*) + c02 * alpha_vec;
+            c10_ptr.* = @as(Vec, c10_ptr.*) + c10 * alpha_vec;
+            c11_ptr.* = @as(Vec, c11_ptr.*) + c11 * alpha_vec;
+            c12_ptr.* = @as(Vec, c12_ptr.*) + c12 * alpha_vec;
+            c20_ptr.* = @as(Vec, c20_ptr.*) + c20 * alpha_vec;
+            c21_ptr.* = @as(Vec, c21_ptr.*) + c21 * alpha_vec;
+            c22_ptr.* = @as(Vec, c22_ptr.*) + c22 * alpha_vec;
+            c30_ptr.* = @as(Vec, c30_ptr.*) + c30 * alpha_vec;
+            c31_ptr.* = @as(Vec, c31_ptr.*) + c31 * alpha_vec;
+            c32_ptr.* = @as(Vec, c32_ptr.*) + c32 * alpha_vec;
+        }
+
+        // Handle remaining columns (8 at a time)
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            var c0: Vec = @splat(0.0);
+            var c1: Vec = @splat(0.0);
+            var c2: Vec = @splat(0.0);
+            var c3: Vec = @splat(0.0);
+
+            for (0..K) |kk| {
+                const b_vec: Vec = B[kk * ldb + j ..][0..VEC_WIDTH].*;
+                c0 += @as(Vec, @splat(A[(i + 0) * lda + kk])) * b_vec;
+                c1 += @as(Vec, @splat(A[(i + 1) * lda + kk])) * b_vec;
+                c2 += @as(Vec, @splat(A[(i + 2) * lda + kk])) * b_vec;
+                c3 += @as(Vec, @splat(A[(i + 3) * lda + kk])) * b_vec;
+            }
+
+            const alpha_vec: Vec = @splat(alpha);
+            const c0_ptr = C[(i + 0) * ldc + j ..][0..VEC_WIDTH];
+            const c1_ptr = C[(i + 1) * ldc + j ..][0..VEC_WIDTH];
+            const c2_ptr = C[(i + 2) * ldc + j ..][0..VEC_WIDTH];
+            const c3_ptr = C[(i + 3) * ldc + j ..][0..VEC_WIDTH];
+            c0_ptr.* = @as(Vec, c0_ptr.*) + c0 * alpha_vec;
+            c1_ptr.* = @as(Vec, c1_ptr.*) + c1 * alpha_vec;
+            c2_ptr.* = @as(Vec, c2_ptr.*) + c2 * alpha_vec;
+            c3_ptr.* = @as(Vec, c3_ptr.*) + c3 * alpha_vec;
+        }
+
+        // Scalar tail
+        while (j < N) : (j += 1) {
+            var c0: f32 = 0.0;
+            var c1: f32 = 0.0;
+            var c2: f32 = 0.0;
+            var c3: f32 = 0.0;
+            for (0..K) |kk| {
+                const b_val = B[kk * ldb + j];
+                c0 += A[(i + 0) * lda + kk] * b_val;
+                c1 += A[(i + 1) * lda + kk] * b_val;
+                c2 += A[(i + 2) * lda + kk] * b_val;
+                c3 += A[(i + 3) * lda + kk] * b_val;
+            }
+            C[(i + 0) * ldc + j] += alpha * c0;
+            C[(i + 1) * ldc + j] += alpha * c1;
+            C[(i + 2) * ldc + j] += alpha * c2;
+            C[(i + 3) * ldc + j] += alpha * c3;
+        }
+    }
+
+    // Handle remaining rows (< 4)
+    while (i < M) : (i += 1) {
+        var j: usize = 0;
+
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            var c0: Vec = @splat(0.0);
+            for (0..K) |kk| {
+                const a_val: Vec = @splat(A[i * lda + kk]);
+                const b_vec: Vec = B[kk * ldb + j ..][0..VEC_WIDTH].*;
+                c0 += a_val * b_vec;
+            }
+            const alpha_vec: Vec = @splat(alpha);
+            const c0_ptr = C[i * ldc + j ..][0..VEC_WIDTH];
+            c0_ptr.* = @as(Vec, c0_ptr.*) + c0 * alpha_vec;
+        }
+
+        while (j < N) : (j += 1) {
+            var c0: f32 = 0.0;
+            for (0..K) |kk| {
+                c0 += A[i * lda + kk] * B[kk * ldb + j];
+            }
+            C[i * ldc + j] += alpha * c0;
+        }
+    }
 }
 
 /// SGEMM with leading dimension parameters - cache-blocked implementation

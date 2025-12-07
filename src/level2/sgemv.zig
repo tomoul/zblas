@@ -36,7 +36,7 @@ pub fn sgemv(
     sgemvOptimized(M, N, A, N, x, y, alpha, beta);
 }
 
-/// SGEMV with leading dimension parameter
+/// SGEMV with leading dimension parameter - optimized with multi-row processing
 fn sgemvOptimized(
     M: usize,
     N: usize,
@@ -50,24 +50,85 @@ fn sgemvOptimized(
     const VEC_WIDTH = comptime config.getVectorWidth();
     const Vec = @Vector(VEC_WIDTH, f32);
 
-    // Scale y by beta
+    // Scale y by beta with SIMD
     if (beta == 0.0) {
         @memset(y[0..M], 0.0);
     } else if (beta != 1.0) {
-        for (y[0..M]) |*val| {
-            val.* *= beta;
+        const beta_vec: Vec = @splat(beta);
+        var i: usize = 0;
+        while (i + VEC_WIDTH <= M) : (i += VEC_WIDTH) {
+            const y_vec: Vec = y[i..][0..VEC_WIDTH].*;
+            y[i..][0..VEC_WIDTH].* = y_vec * beta_vec;
+        }
+        while (i < M) : (i += 1) {
+            y[i] *= beta;
         }
     }
 
     // If alpha is zero, we're done
     if (alpha == 0.0) return;
 
-    // Process each row
-    for (0..M) |i| {
+    // Process multiple rows at once for better cache utilization
+    // x vector is reused across rows, so keeping it in cache helps
+    const ROWS_PER_ITER = 4;
+    var i: usize = 0;
+
+    while (i + ROWS_PER_ITER <= M) : (i += ROWS_PER_ITER) {
+        var sum0: f32 = 0.0;
+        var sum1: f32 = 0.0;
+        var sum2: f32 = 0.0;
+        var sum3: f32 = 0.0;
+
+        var j: usize = 0;
+
+        // Vectorized inner loop - process VEC_WIDTH elements at a time
+        if (VEC_WIDTH > 1 and N >= VEC_WIDTH) {
+            var sum0_vec: Vec = @splat(0.0);
+            var sum1_vec: Vec = @splat(0.0);
+            var sum2_vec: Vec = @splat(0.0);
+            var sum3_vec: Vec = @splat(0.0);
+
+            while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+                const x_vec: Vec = x[j..][0..VEC_WIDTH].*;
+
+                const a0: Vec = A[(i + 0) * lda + j ..][0..VEC_WIDTH].*;
+                const a1: Vec = A[(i + 1) * lda + j ..][0..VEC_WIDTH].*;
+                const a2: Vec = A[(i + 2) * lda + j ..][0..VEC_WIDTH].*;
+                const a3: Vec = A[(i + 3) * lda + j ..][0..VEC_WIDTH].*;
+
+                sum0_vec += a0 * x_vec;
+                sum1_vec += a1 * x_vec;
+                sum2_vec += a2 * x_vec;
+                sum3_vec += a3 * x_vec;
+            }
+
+            // Reduce vectors to scalars
+            sum0 = @reduce(.Add, sum0_vec);
+            sum1 = @reduce(.Add, sum1_vec);
+            sum2 = @reduce(.Add, sum2_vec);
+            sum3 = @reduce(.Add, sum3_vec);
+        }
+
+        // Scalar tail
+        while (j < N) : (j += 1) {
+            const x_val = x[j];
+            sum0 += A[(i + 0) * lda + j] * x_val;
+            sum1 += A[(i + 1) * lda + j] * x_val;
+            sum2 += A[(i + 2) * lda + j] * x_val;
+            sum3 += A[(i + 3) * lda + j] * x_val;
+        }
+
+        y[i + 0] += alpha * sum0;
+        y[i + 1] += alpha * sum1;
+        y[i + 2] += alpha * sum2;
+        y[i + 3] += alpha * sum3;
+    }
+
+    // Handle remaining rows (< 4)
+    while (i < M) : (i += 1) {
         var sum: f32 = 0.0;
         var j: usize = 0;
 
-        // SIMD loop
         if (VEC_WIDTH > 1 and N >= VEC_WIDTH) {
             var sum_vec: Vec = @splat(0.0);
 
@@ -77,11 +138,9 @@ fn sgemvOptimized(
                 sum_vec += a_vec * x_vec;
             }
 
-            // Reduce vector to scalar
             sum = @reduce(.Add, sum_vec);
         }
 
-        // Scalar tail
         while (j < N) : (j += 1) {
             sum += A[i * lda + j] * x[j];
         }
