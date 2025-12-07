@@ -4,4 +4,3 @@ zig-out/
 *md
 **/*.md
 cblas.h
-src/util/packing.zig
