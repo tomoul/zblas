@@ -8,10 +8,16 @@
 // Phase 2: Cache-blocked implementation with 4x4 generic micro-kernel
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../config.zig");
 const reference = @import("../reference.zig");
 const packing = @import("../util/packing.zig");
-const micro_kernel = @import("../kernel/generic/sgemm_kernel_4x4.zig");
+
+// Select micro-kernel based on architecture
+const micro_kernel = switch (builtin.cpu.arch) {
+    .x86_64 => @import("../kernel/x86_64/sgemm_kernel_8x8.zig"),
+    else => @import("../kernel/generic/sgemm_kernel_4x4.zig"),
+};
 
 // Re-export Transpose type from parent
 pub const Transpose = @import("../zblas.zig").Transpose;
@@ -66,11 +72,19 @@ fn sgemmOptimized(
     const MR = micro_kernel.mr;
     const NR = micro_kernel.nr;
 
-    // Allocate packing buffers on stack
-    // For generic: MC=128, KC=256 -> 128*256 = 32KB for A
-    // KC=256, NC=1024 -> 256*1024 = 256KB for B
-    var packed_a: [MC * KC]f32 = undefined;
-    var packed_b: [KC * NC]f32 = undefined;
+    // Allocate packing buffers
+    // For x86_64: MC=256, KC=512, NC=4096
+    //   packed_a: 256*512 = 128KB
+    //   packed_b: 512*4096 = 2MB (too large for stack)
+    // Use static thread-local buffers to avoid allocation overhead
+    const PackedA = struct {
+        threadlocal var buf: [MC * KC]f32 = undefined;
+    };
+    const PackedB = struct {
+        threadlocal var buf: [KC * NC]f32 = undefined;
+    };
+    const packed_a: *[MC * KC]f32 = &PackedA.buf;
+    const packed_b: *[KC * NC]f32 = &PackedB.buf;
 
     // Scale C by beta first (applied once before all accumulation)
     if (beta == 0.0) {
@@ -100,7 +114,7 @@ fn sgemmOptimized(
             packing.packB(
                 B[pc * ldb + jc ..],
                 ldb,
-                &packed_b,
+                packed_b,
                 pb,
                 jb,
                 NR,
@@ -115,7 +129,7 @@ fn sgemmOptimized(
                 packing.packA(
                     A[ic * lda + pc ..],
                     lda,
-                    &packed_a,
+                    packed_a,
                     ib,
                     pb,
                     MR,
@@ -123,8 +137,8 @@ fn sgemmOptimized(
 
                 // Compute C[ic:ic+ib, jc:jc+jb] += packed_A * packed_B
                 computeBlock(
-                    &packed_a,
-                    &packed_b,
+                    packed_a,
+                    packed_b,
                     C[ic * ldc + jc ..],
                     ldc,
                     ib,
