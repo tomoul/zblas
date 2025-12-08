@@ -3,8 +3,20 @@
 //
 // Packing rearranges matrix data so micro-kernels access memory sequentially,
 // maximizing cache utilization and avoiding TLB misses.
+//
+// Architecture-specific implementations:
+// - x86_64: Uses AVX2 vector loads/stores for 8-wide packing
+// - ARM64: Uses NEON vector loads/stores for 8-wide packing
+// - Generic: Scalar fallback for other architectures
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// Architecture-specific packing implementations
+const has_arch_packing = builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64;
+
+const arch_packing_x86_64 = if (builtin.cpu.arch == .x86_64) @import("packing_x86_64.zig") else struct {};
+const arch_packing_arm64 = if (builtin.cpu.arch == .aarch64) @import("packing_arm64.zig") else struct {};
 
 /// Pack A into MR-wide column panels for cache-efficient access.
 ///
@@ -27,6 +39,29 @@ const std = @import("std");
 ///   mr: Micro-kernel row count (panel width)
 ///
 pub fn packA(
+    A: []const f32,
+    lda: usize,
+    dest: []f32,
+    m: usize,
+    k: usize,
+    mr: usize,
+) void {
+    // Use architecture-optimized version for MR=8
+    if (has_arch_packing and mr == 8) {
+        if (builtin.cpu.arch == .x86_64) {
+            arch_packing_x86_64.packA8(A.ptr, lda, dest.ptr, m, k);
+        } else if (builtin.cpu.arch == .aarch64) {
+            arch_packing_arm64.packA8(A.ptr, lda, dest.ptr, m, k);
+        }
+        return;
+    }
+
+    // Generic fallback implementation
+    packAGeneric(A, lda, dest, m, k, mr);
+}
+
+/// Generic (scalar) packA implementation
+fn packAGeneric(
     A: []const f32,
     lda: usize,
     dest: []f32,
@@ -88,6 +123,29 @@ pub fn packA(
 ///   nr: Micro-kernel column count (panel width)
 ///
 pub fn packB(
+    B: []const f32,
+    ldb: usize,
+    dest: []f32,
+    k: usize,
+    n: usize,
+    nr: usize,
+) void {
+    // Use architecture-optimized version for NR=8
+    if (has_arch_packing and nr == 8) {
+        if (builtin.cpu.arch == .x86_64) {
+            arch_packing_x86_64.packB8(B.ptr, ldb, dest.ptr, k, n);
+        } else if (builtin.cpu.arch == .aarch64) {
+            arch_packing_arm64.packB8(B.ptr, ldb, dest.ptr, k, n);
+        }
+        return;
+    }
+
+    // Generic fallback implementation
+    packBGeneric(B, ldb, dest, k, n, nr);
+}
+
+/// Generic (scalar) packB implementation
+fn packBGeneric(
     B: []const f32,
     ldb: usize,
     dest: []f32,

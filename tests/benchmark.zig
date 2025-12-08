@@ -30,6 +30,9 @@ pub fn main() !void {
     // Run SGEMV benchmarks
     try benchmarkSgemv();
 
+    // Run packing benchmark
+    try benchmarkPacking();
+
     print("\n===========================================\n", .{});
     print("           Benchmark Complete              \n", .{});
     print("===========================================\n", .{});
@@ -41,7 +44,7 @@ fn benchmarkSgemm() !void {
     print("{s:>8} {s:>12} {s:>12} {s:>10}\n", .{ "Size", "Time (ms)", "GFLOPS", "Efficiency" });
     print("-------------------------------------------\n", .{});
 
-    const sizes = [_]usize{ 64, 128, 256, 512, 1024 };
+    const sizes = [_]usize{ 64, 128, 256, 512, 1024, 2048, 3072 };
     const allocator = std.heap.page_allocator;
 
     for (sizes) |n| {
@@ -240,6 +243,82 @@ fn benchmarkSgemv() !void {
             n,
             avg_time,
             bandwidth,
+        });
+    }
+
+    print("\n", .{});
+}
+
+fn benchmarkPacking() !void {
+    const packing = @import("zblas").packing;
+
+    print("Packing Benchmarks (optimized vs generic)\n", .{});
+    print("-------------------------------------------\n", .{});
+    print("{s:>8} {s:>14} {s:>14} {s:>10}\n", .{ "Size", "PackA (us)", "PackB (us)", "GB/s" });
+    print("-------------------------------------------\n", .{});
+
+    const sizes = [_]usize{ 256, 512, 1024, 2048 };
+    const allocator = std.heap.page_allocator;
+
+    // Use MR=8, NR=8 for optimized path
+    const MR = 8;
+    const NR = 8;
+
+    for (sizes) |n| {
+        // Allocate source matrices
+        const A = try allocator.alloc(f32, n * n);
+        defer allocator.free(A);
+        const B = try allocator.alloc(f32, n * n);
+        defer allocator.free(B);
+
+        // Allocate packed buffers (with padding for MR/NR)
+        const packed_a_size = ((n + MR - 1) / MR) * MR * n;
+        const packed_b_size = n * ((n + NR - 1) / NR) * NR;
+
+        const packed_a = try allocator.alloc(f32, packed_a_size);
+        defer allocator.free(packed_a);
+        const packed_b = try allocator.alloc(f32, packed_b_size);
+        defer allocator.free(packed_b);
+
+        // Initialize with values
+        for (0..n * n) |i| {
+            A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+            B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+        }
+
+        // Warmup
+        packing.packA(A, n, packed_a, n, n, MR);
+        packing.packB(B, n, packed_b, n, n, NR);
+
+        // Benchmark packA
+        const iterations: usize = if (n <= 512) 100 else 20;
+        var pack_a_time: f64 = 0.0;
+        var pack_b_time: f64 = 0.0;
+
+        for (0..iterations) |_| {
+            var timer = std.time.Timer.start() catch unreachable;
+            packing.packA(A, n, packed_a, n, n, MR);
+            pack_a_time += @as(f64, @floatFromInt(timer.read())) / 1000.0;
+        }
+
+        for (0..iterations) |_| {
+            var timer = std.time.Timer.start() catch unreachable;
+            packing.packB(B, n, packed_b, n, n, NR);
+            pack_b_time += @as(f64, @floatFromInt(timer.read())) / 1000.0;
+        }
+
+        const avg_pack_a = pack_a_time / @as(f64, @floatFromInt(iterations));
+        const avg_pack_b = pack_b_time / @as(f64, @floatFromInt(iterations));
+
+        // Calculate bandwidth (read source + write dest)
+        const bytes_a: f64 = @as(f64, @floatFromInt(n * n)) * 4.0 * 2.0; // read + write
+        const bandwidth_a = bytes_a / (avg_pack_a / 1_000_000.0) / 1e9;
+
+        print("{d:>8} {d:>14.2} {d:>14.2} {d:>9.1}\n", .{
+            n,
+            avg_pack_a,
+            avg_pack_b,
+            bandwidth_a,
         });
     }
 

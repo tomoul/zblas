@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 
 pub const config = @import("config.zig");
 pub const reference = @import("reference.zig");
+pub const packing = @import("util/packing.zig");
 
 // Import optimized implementations
 const sgemm_impl = @import("level3/sgemm.zig");
