@@ -24,6 +24,9 @@ pub fn main() !void {
     // Run SGEMM benchmarks
     try benchmarkSgemm();
 
+    // Run fused vs standard SGEMM comparison
+    try benchmarkFusedSgemm();
+
     // Run parallel SGEMM scaling benchmarks
     try benchmarkParallelScaling();
 
@@ -100,6 +103,82 @@ fn benchmarkSgemm() !void {
             avg_time,
             gflops,
             efficiency,
+        });
+    }
+
+    print("\n", .{});
+}
+
+fn benchmarkFusedSgemm() !void {
+    print("Fused vs Standard SGEMM Comparison\n", .{});
+    print("-------------------------------------------\n", .{});
+    print("Fused SGEMM eliminates B packing buffer, reading B directly.\n", .{});
+    print("-------------------------------------------\n", .{});
+    print("{s:>8} {s:>12} {s:>12} {s:>12} {s:>10}\n", .{ "Size", "Standard", "Fused", "Speedup", "GFLOPS" });
+    print("{s:>8} {s:>12} {s:>12} {s:>12} {s:>10}\n", .{ "", "(ms)", "(ms)", "", "(fused)" });
+    print("-------------------------------------------\n", .{});
+
+    const sizes = [_]usize{ 256, 512, 1024, 2048, 3072 };
+    const allocator = std.heap.page_allocator;
+
+    for (sizes) |n| {
+        const flops: f64 = 2.0 * @as(f64, @floatFromInt(n)) *
+            @as(f64, @floatFromInt(n)) *
+            @as(f64, @floatFromInt(n));
+
+        // Allocate matrices
+        const A = try allocator.alloc(f32, n * n);
+        defer allocator.free(A);
+        const B = try allocator.alloc(f32, n * n);
+        defer allocator.free(B);
+        const C = try allocator.alloc(f32, n * n);
+        defer allocator.free(C);
+
+        // Initialize with random-ish values
+        for (0..n * n) |i| {
+            A[i] = @as(f32, @floatFromInt(i % 100)) / 100.0;
+            B[i] = @as(f32, @floatFromInt((i * 7) % 100)) / 100.0;
+        }
+
+        const iterations: usize = if (n <= 512) 5 else 3;
+
+        // Benchmark standard SGEMM
+        @memset(C, 0.0);
+        zblas.sgemm(n, n, n, A, B, C, 1.0, 0.0); // warmup
+
+        var standard_time: f64 = 0.0;
+        for (0..iterations) |_| {
+            @memset(C, 0.0);
+            var timer = std.time.Timer.start() catch unreachable;
+            zblas.sgemm(n, n, n, A, B, C, 1.0, 0.0);
+            const elapsed = timer.read();
+            standard_time += @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+        }
+        standard_time /= @as(f64, @floatFromInt(iterations));
+
+        // Benchmark fused SGEMM
+        @memset(C, 0.0);
+        zblas.sgemmFused(n, n, n, A, B, C, 1.0, 0.0); // warmup
+
+        var fused_time: f64 = 0.0;
+        for (0..iterations) |_| {
+            @memset(C, 0.0);
+            var timer = std.time.Timer.start() catch unreachable;
+            zblas.sgemmFused(n, n, n, A, B, C, 1.0, 0.0);
+            const elapsed = timer.read();
+            fused_time += @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+        }
+        fused_time /= @as(f64, @floatFromInt(iterations));
+
+        const speedup = standard_time / fused_time;
+        const gflops = flops / (fused_time / 1000.0) / 1e9;
+
+        print("{d:>8} {d:>12.3} {d:>12.3} {d:>11.2}x {d:>9.2}\n", .{
+            n,
+            standard_time,
+            fused_time,
+            speedup,
+            gflops,
         });
     }
 

@@ -101,6 +101,65 @@ pub fn sgemmTranspose(
 }
 
 // ============================================================================
+// Fused SGEMM (Phase 10)
+// ============================================================================
+
+/// Fused SGEMM: C = alpha*A*B + beta*C with fused B packing
+///
+/// This variant eliminates the separate B packing step by reading B directly
+/// during computation. Benefits:
+/// - Reduces memory traffic by ~33% (no packed B buffer writes/reads)
+/// - Smaller working set (no KC*NC packed B buffer needed)
+/// - Can be faster for memory-bound workloads
+///
+/// Trade-offs:
+/// - B access pattern is less regular than packed format
+/// - May be slower if B is not cache-resident
+/// - Only works for NN (no transpose) case
+///
+/// Use this when:
+/// - Matrix is large enough that packing overhead matters (>512 dimensions)
+/// - Memory bandwidth is the bottleneck
+/// - B is not reused across multiple operations
+///
+/// Parameters:
+///   - M, N, K: Matrix dimensions (A is MxK, B is KxN, C is MxN)
+///   - A, B: Input matrices in row-major order
+///   - C: Output matrix in row-major order
+///   - alpha, beta: Scalar multipliers
+pub fn sgemmFused(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B: []const f32,
+    C: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemm_impl.sgemmFused(M, N, K, A, K, B, N, C, N, alpha, beta);
+}
+
+/// Fused SGEMM with explicit leading dimensions
+///
+/// Same as sgemmFused but allows custom leading dimensions for submatrix operations.
+pub fn sgemmFusedLd(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemm_impl.sgemmFused(M, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
+}
+
+// ============================================================================
 // Parallel SGEMM (Phase 6)
 // ============================================================================
 

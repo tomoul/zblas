@@ -20,6 +20,10 @@ const micro_kernel = switch (builtin.cpu.arch) {
     else => @import("../kernel/generic/sgemm_kernel_4x4.zig"),
 };
 
+// Fused kernel for x86_64 (packs B on-the-fly during computation)
+const fused_kernel_impl = @import("../kernel/x86_64/sgemm_kernel_fused.zig");
+const has_fused_kernel = builtin.cpu.arch == .x86_64;
+
 // Fast 4x24 kernel for direct (non-packed) path on x86_64
 const fast_kernel = switch (builtin.cpu.arch) {
     .x86_64 => @import("../kernel/x86_64/sgemm_kernel_4x24.zig"),
@@ -607,6 +611,226 @@ fn scalarMicroKernel(
                 // A[i] at position kk is at A[kk * mr + i]
                 // B[j] at position kk is at B[kk * nr + j]
                 sum += A[kk * mr + i] * B[kk * nr + j];
+            }
+            C[i * ldc + j] += alpha * sum;
+        }
+    }
+}
+
+// ============================================================================
+// Fused SGEMM Implementation (Phase 10)
+// ============================================================================
+//
+// Fused GEMM eliminates the need for a separate packed B buffer by reading
+// B directly during computation. This reduces memory traffic significantly:
+//
+// Standard flow:  Read B -> Pack B to buffer -> Read packed B -> Compute
+// Fused flow:     Read B -> Compute immediately
+//
+// Benefits:
+// - Eliminates one full memory pass over B
+// - Reduces memory bandwidth by ~33% for memory-bound workloads
+// - Smaller working set (no packed_b buffer needed)
+//
+// Trade-offs:
+// - B access pattern is less regular (row-major vs packed)
+// - May be slower if B is not in cache (less prefetch-friendly)
+// - Only works when B is not transposed
+//
+
+/// Fused SGEMM: C = alpha*A*B + beta*C with fused B packing
+/// Only packs A, reads B directly during computation.
+///
+/// This is optimized for the NN (no transpose) case and works best when:
+/// - Matrix is large enough that packing overhead matters
+/// - B is accessed once (not reused across multiple A blocks)
+/// - Memory bandwidth is the bottleneck
+pub fn sgemmFused(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    // Only available on x86_64 with fused kernel
+    if (!has_fused_kernel) {
+        // Fallback to standard optimized path
+        sgemmOptimized(M, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
+        return;
+    }
+
+    // Small matrices: use reference
+    if (M * N * K < config.MIN_OPTIMIZED_SIZE * config.MIN_OPTIMIZED_SIZE * config.MIN_OPTIMIZED_SIZE) {
+        reference.sgemm_reference_simple(M, N, K, A, B, C, alpha, beta);
+        return;
+    }
+
+    // Fast path selection based on alpha/beta
+    const use_fast_path = (alpha == 1.0 and beta == 0.0);
+    const use_beta_zero = (beta == 0.0);
+
+    // Cache blocking parameters (use config.* directly for buffer sizes)
+    const MC = config.MC;
+    const KC = config.KC;
+    const NC = config.NC;
+    const MR = fused_kernel_impl.mr;
+
+    // Only need packed A buffer (no packed B!)
+    const PackedA = struct {
+        threadlocal var buf: [config.MC * config.KC]f32 = undefined;
+    };
+    const packed_a: *[config.MC * config.KC]f32 = &PackedA.buf;
+
+    // Scale C by beta first (if not using fast path which overwrites)
+    if (!use_fast_path) {
+        if (beta == 0.0) {
+            for (0..M) |i| {
+                @memset(C[i * ldc ..][0..N], 0.0);
+            }
+        } else if (beta != 1.0) {
+            for (0..M) |i| {
+                for (0..N) |j| {
+                    C[i * ldc + j] *= beta;
+                }
+            }
+        }
+    }
+
+    // Main blocking loops (GotoBLAS algorithm with fused B)
+    var jc: usize = 0;
+    while (jc < N) : (jc += NC) {
+        const jb = @min(NC, N - jc);
+
+        var pc: usize = 0;
+        while (pc < K) : (pc += KC) {
+            const pb = @min(KC, K - pc);
+
+            // NO B packing here - we read B directly in the kernel!
+
+            var ic: usize = 0;
+            while (ic < M) : (ic += MC) {
+                const ib = @min(MC, M - ic);
+
+                // Pack A block [ib × pb]
+                packing.packA(
+                    A[ic * lda + pc ..],
+                    lda,
+                    packed_a,
+                    ib,
+                    pb,
+                    MR,
+                );
+
+                // Compute with fused B packing
+                // Pass pointer to B[pc * ldb + jc] (start of B panel)
+                computeBlockFused(
+                    packed_a,
+                    B[pc * ldb + jc ..].ptr,
+                    ldb,
+                    C[ic * ldc + jc ..].ptr,
+                    ldc,
+                    ib,
+                    jb,
+                    pb,
+                    alpha,
+                    use_fast_path,
+                    use_beta_zero,
+                    pc == 0, // first_k_block: only first iteration should overwrite
+                );
+            }
+        }
+    }
+}
+
+/// Compute a block using fused kernel (reads B directly)
+fn computeBlockFused(
+    packed_a: []const f32,
+    B: [*]const f32,
+    ldb: usize,
+    C: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    use_fast_path: bool,
+    use_beta_zero: bool,
+    first_k_block: bool,
+) void {
+    if (!has_fused_kernel) return;
+
+    const MR = fused_kernel_impl.mr;
+    const NR = fused_kernel_impl.nr;
+
+    var jr: usize = 0;
+    while (jr < n) : (jr += NR) {
+        const nr_actual = @min(NR, n - jr);
+
+        var ir: usize = 0;
+        while (ir < m) : (ir += MR) {
+            const mr_actual = @min(MR, m - ir);
+
+            if (mr_actual == MR and nr_actual == NR) {
+                // Full 8x8 micro-kernel with fused B access
+                // B pointer: B + jr (offset to correct column)
+                const b_ptr = B + jr;
+                const c_ptr = C + ir * ldc + jr;
+
+                if (use_fast_path and first_k_block) {
+                    // Ultimate fast path: alpha=1, beta=0, first k block
+                    fused_kernel_impl.kernelFusedFast(k, @ptrCast(packed_a.ptr + ir * k), b_ptr, ldb, c_ptr, ldc);
+                } else if (use_beta_zero and first_k_block) {
+                    // Beta=0 fast path (first k block only)
+                    fused_kernel_impl.kernelFusedBetaZero(k, @ptrCast(packed_a.ptr + ir * k), b_ptr, ldb, c_ptr, ldc, alpha);
+                } else {
+                    // General case: accumulate to existing C
+                    fused_kernel_impl.kernelFused(k, @ptrCast(packed_a.ptr + ir * k), b_ptr, ldb, c_ptr, ldc, alpha);
+                }
+            } else {
+                // Edge case: scalar fallback for partial tiles
+                scalarMicroKernelFused(
+                    packed_a[ir * k ..],
+                    B + jr,
+                    ldb,
+                    C + ir * ldc + jr,
+                    ldc,
+                    mr_actual,
+                    nr_actual,
+                    k,
+                    alpha,
+                    MR,
+                );
+            }
+        }
+    }
+}
+
+/// Scalar micro-kernel for fused edge cases
+fn scalarMicroKernelFused(
+    A: []const f32,
+    B: [*]const f32,
+    ldb: usize,
+    C: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    mr: usize,
+) void {
+    // A is packed: for each kk, elements [kk*mr .. kk*mr + m] contain the m rows
+    // B is original: B[kk * ldb + j] for row kk, col j
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var sum: f32 = 0.0;
+            for (0..k) |kk| {
+                sum += A[kk * mr + i] * B[kk * ldb + j];
             }
             C[i * ldc + j] += alpha * sum;
         }
