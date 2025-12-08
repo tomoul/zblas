@@ -283,6 +283,13 @@ pub fn getInfo() struct {
     };
 }
 
+// Export cache blocking parameters for benchmarking/debugging
+pub const MC = config.MC;
+pub const KC = config.KC;
+pub const NC = config.NC;
+pub const MR = config.MR;
+pub const NR = config.NR;
+
 // ============================================================================
 // Tests
 // ============================================================================

@@ -70,6 +70,27 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_benchmark.step);
 
     // ==========================================================================
+    // Cache Blocking Benchmark (Agent 6)
+    // ==========================================================================
+    const cache_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark_cache.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    cache_bench_module.addImport("zblas", zblas_module);
+
+    const cache_benchmark = b.addExecutable(.{
+        .name = "zblas-cache-benchmark",
+        .root_module = cache_bench_module,
+    });
+
+    b.installArtifact(cache_benchmark);
+
+    const run_cache_benchmark = b.addRunArtifact(cache_benchmark);
+    const cache_bench_step = b.step("bench-cache", "Run cache blocking benchmarks");
+    cache_bench_step.dependOn(&run_cache_benchmark.step);
+
+    // ==========================================================================
     // Reference Tests (verify against naive implementation)
     // ==========================================================================
     const ref_test_module = b.createModule(.{
