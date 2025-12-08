@@ -70,6 +70,27 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_benchmark.step);
 
     // ==========================================================================
+    // Whisper-specific Benchmark (Agent 9)
+    // ==========================================================================
+    const whisper_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark_whisper.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    whisper_bench_module.addImport("zblas", zblas_module);
+
+    const whisper_benchmark = b.addExecutable(.{
+        .name = "zblas-whisper-benchmark",
+        .root_module = whisper_bench_module,
+    });
+
+    b.installArtifact(whisper_benchmark);
+
+    const run_whisper_benchmark = b.addRunArtifact(whisper_benchmark);
+    const whisper_bench_step = b.step("bench-whisper", "Run Whisper-specific benchmarks");
+    whisper_bench_step.dependOn(&run_whisper_benchmark.step);
+
+    // ==========================================================================
     // Cache Blocking Benchmark (Agent 6)
     // ==========================================================================
     const cache_bench_module = b.createModule(.{

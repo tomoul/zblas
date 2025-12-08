@@ -53,16 +53,38 @@ pub inline fn sgemm(
         return;
     }
 
-    // Use direct SIMD path - simpler and usually faster for AI workloads
-    // The packed/blocked path is mainly useful for very large matrices (>2048)
-    // where cache reuse becomes critical
+    // Algorithm selection based on matrix size and shape
+    // Key insight from benchmarks:
+    // - Direct path works well for small/medium matrices (≤512 max dim)
+    // - Blocked path is much faster for larger matrices due to cache reuse
+    // - Skinny matrices (M or N < 64) benefit from simpler row-by-row approach
     const max_dim = @max(M, @max(N, K));
-    if (max_dim <= 2048) {
+    const min_dim = @min(M, @min(N, K));
+
+    // Use direct path for small matrices or very skinny matrices
+    // where packing overhead outweighs cache benefits
+    const use_direct = blk: {
+        // Very small: direct is always better (no packing overhead)
+        if (max_dim <= 128) break :blk true;
+
+        // Skinny matrices: direct is better (less data reuse to amortize packing)
+        if (min_dim <= 32) break :blk true;
+
+        // Medium matrices: use direct if total work is small enough
+        // that packing overhead dominates
+        const work = M * N * K;
+        if (work <= 256 * 256 * 256) break :blk true;
+
+        // Larger matrices: blocked path with packing wins
+        break :blk false;
+    };
+
+    if (use_direct) {
         sgemmDirect(M, N, K, A, K, B, N, C, N, alpha, beta);
         return;
     }
 
-    // Very large matrices: use cache-blocked implementation with packing
+    // Larger matrices: use cache-blocked implementation with packing
     sgemmOptimized(M, N, K, A, K, B, N, C, N, alpha, beta);
 }
 
