@@ -20,6 +20,7 @@ pub const packing = @import("util/packing.zig");
 const sgemm_impl = @import("level3/sgemm.zig");
 const sgemm_q8_impl = @import("level3/sgemm_q8.zig");
 const sgemm_q8k_impl = @import("level3/sgemm_q8k.zig");
+const sgemm_bias_impl = @import("level3/sgemm_bias.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
 const level1 = @import("level1/blas_level1.zig");
@@ -102,6 +103,29 @@ pub fn sgemmTranspose(
     beta: f32,
 ) void {
     sgemm_impl.sgemmTranspose(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
+}
+
+// ============================================================================
+// Fused SGEMM + Bias (Phase 14)
+// ============================================================================
+
+/// Fused SGEMM + bias: C = A*B + broadcast(bias)
+///
+/// Eliminates the separate bias addition pass by fusing it into the SGEMM
+/// store epilogue. bias is a [N] vector broadcast to every row of C.
+///
+/// Uses specialized skinny-M kernel for M ≤ 32 (typical for inference).
+/// Falls back to sgemm + separate bias add for larger M.
+pub fn sgemmBias(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B: []const f32,
+    bias: [*]const f32,
+    C: []f32,
+) void {
+    sgemm_bias_impl.sgemmBias(M, N, K, A, B, bias, C);
 }
 
 // ============================================================================

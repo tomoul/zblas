@@ -466,3 +466,97 @@ test "context sgemm multi-threaded" {
         try std.testing.expectApproxEqRel(C_ctx[i], C_ref[i], 1e-4);
     }
 }
+
+// ============================================================================
+// SGEMM + Bias Fusion Tests
+// ============================================================================
+
+test "sgemmBias basic 2x3" {
+    const A = [_]f32{ 1, 2, 3, 4 };
+    const B = [_]f32{ 5, 6, 7, 8, 9, 10 };
+    const bias = [_]f32{ 1, -1, 0.5 };
+    var C = [_]f32{ 0, 0, 0, 0, 0, 0 };
+
+    zblas.sgemmBias(2, 3, 2, &A, &B, &bias, &C);
+
+    try std.testing.expectApproxEqAbs(C[0], 22.0, 1e-5);
+    try std.testing.expectApproxEqAbs(C[1], 23.0, 1e-5);
+    try std.testing.expectApproxEqAbs(C[2], 27.5, 1e-5);
+    try std.testing.expectApproxEqAbs(C[3], 48.0, 1e-5);
+    try std.testing.expectApproxEqAbs(C[4], 53.0, 1e-5);
+    try std.testing.expectApproxEqAbs(C[5], 61.5, 1e-5);
+}
+
+test "sgemmBias vs separate (M=8,N=384,K=384)" {
+    const allocator = std.testing.allocator;
+    const M = 8;
+    const N = 384;
+    const K = 384;
+
+    const A = try allocator.alloc(f32, M * K);
+    defer allocator.free(A);
+    const B = try allocator.alloc(f32, K * N);
+    defer allocator.free(B);
+    const bias = try allocator.alloc(f32, N);
+    defer allocator.free(bias);
+    const C_fused = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_fused);
+    const C_separate = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_separate);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const random = rng.random();
+    for (A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (B) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (bias) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+
+    zblas.sgemmBias(M, N, K, A, B, bias.ptr, C_fused);
+
+    zblas.sgemm(M, N, K, A, B, C_separate, 1.0, 0.0);
+    for (0..M) |row| {
+        for (0..N) |col| {
+            C_separate[row * N + col] += bias[col];
+        }
+    }
+
+    for (0..M * N) |i| {
+        try std.testing.expectApproxEqAbs(C_fused[i], C_separate[i], 1e-3);
+    }
+}
+
+test "sgemmBias FFN shape (M=8,N=1536,K=384)" {
+    const allocator = std.testing.allocator;
+    const M = 8;
+    const N = 1536;
+    const K = 384;
+
+    const A = try allocator.alloc(f32, M * K);
+    defer allocator.free(A);
+    const B = try allocator.alloc(f32, K * N);
+    defer allocator.free(B);
+    const bias = try allocator.alloc(f32, N);
+    defer allocator.free(bias);
+    const C_fused = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_fused);
+    const C_separate = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_separate);
+
+    var rng = std.Random.DefaultPrng.init(7777);
+    const random = rng.random();
+    for (A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (B) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (bias) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+
+    zblas.sgemmBias(M, N, K, A, B, bias.ptr, C_fused);
+
+    zblas.sgemm(M, N, K, A, B, C_separate, 1.0, 0.0);
+    for (0..M) |row| {
+        for (0..N) |col| {
+            C_separate[row * N + col] += bias[col];
+        }
+    }
+
+    for (0..M * N) |i| {
+        try std.testing.expectApproxEqAbs(C_fused[i], C_separate[i], 1e-3);
+    }
+}
