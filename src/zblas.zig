@@ -303,6 +303,23 @@ pub fn sgemv(
     sgemv_impl.sgemv(M, N, A, x, y, alpha, beta);
 }
 
+/// Single-precision Matrix-Vector multiply with transpose: y = alpha*op(A)*x + beta*y
+///
+/// When trans == .NoTrans: A is [M×N], x is [N], y is [M]
+/// When trans == .Trans:   A is [M×N], x is [M], y is [N]
+pub fn sgemvTrans(
+    trans: Transpose,
+    M: usize,
+    N: usize,
+    A: []const f32,
+    x: []const f32,
+    y: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemv_impl.sgemvTrans(trans, M, N, A, x, y, alpha, beta);
+}
+
 // ============================================================================
 // Q8 Weight-Only SGEMM (Quantized Inference)
 // ============================================================================
