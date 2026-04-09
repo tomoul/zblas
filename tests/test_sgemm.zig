@@ -560,3 +560,136 @@ test "sgemmBias FFN shape (M=8,N=1536,K=384)" {
         try std.testing.expectApproxEqAbs(C_fused[i], C_separate[i], 1e-3);
     }
 }
+
+// ============================================================================
+// F16 Weight-Only SGEMM Tests
+// ============================================================================
+
+test "sgemmF16 basic 2x2" {
+    const A = [_]f32{ 1, 2, 3, 4 };
+    const B_f16 = [_]f16{ 5, 6, 7, 8 };
+    var C = [_]f32{ 0, 0, 0, 0 };
+
+    zblas.sgemmF16(2, 2, 2, &A, &B_f16, &C);
+
+    // C = A @ B = [1*5+2*7, 1*6+2*8; 3*5+4*7, 3*6+4*8] = [19, 22; 43, 50]
+    try std.testing.expectApproxEqAbs(C[0], 19.0, 1e-2);
+    try std.testing.expectApproxEqAbs(C[1], 22.0, 1e-2);
+    try std.testing.expectApproxEqAbs(C[2], 43.0, 1e-2);
+    try std.testing.expectApproxEqAbs(C[3], 50.0, 1e-2);
+}
+
+test "sgemmF16 skinny M=8 transformer shape" {
+    const M = 8;
+    const K = 384;
+    const N = 384;
+
+    const allocator = std.testing.allocator;
+
+    const A = try allocator.alloc(f32, M * K);
+    defer allocator.free(A);
+    const B_f16 = try allocator.alloc(f16, K * N);
+    defer allocator.free(B_f16);
+    const C_test = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_test);
+    const C_ref = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_ref);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const random = rng.random();
+    for (A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (B_f16) |*v| v.* = @as(f16, @floatCast(random.float(f32) * 2.0 - 1.0));
+
+    // Reference: naive f16→f32 matmul
+    @memset(C_ref, 0.0);
+    for (0..M) |i| {
+        for (0..K) |k| {
+            const a_val = A[i * K + k];
+            for (0..N) |j| {
+                C_ref[i * N + j] += a_val * @as(f32, @floatCast(B_f16[k * N + j]));
+            }
+        }
+    }
+
+    zblas.sgemmF16(M, N, K, A, B_f16, C_test);
+
+    var max_diff: f32 = 0.0;
+    for (0..M * N) |idx| {
+        const diff = @abs(C_ref[idx] - C_test[idx]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    try std.testing.expect(max_diff < 0.01);
+}
+
+test "sgemmF16 vs f32 sgemm comparison" {
+    // Verify F16 SGEMM matches F32 SGEMM when weights are representable in f16
+    const M = 4;
+    const K = 64;
+    const N = 32;
+
+    var A: [M * K]f32 = undefined;
+    var B_f32: [K * N]f32 = undefined;
+    var B_f16: [K * N]f16 = undefined;
+
+    var rng = std.Random.DefaultPrng.init(77);
+    const random = rng.random();
+    for (&A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    // Use small values that are exact in f16
+    for (&B_f32, 0..) |*v, i| {
+        const f16_val: f16 = @floatCast(random.float(f32) * 2.0 - 1.0);
+        B_f16[i] = f16_val;
+        v.* = @floatCast(f16_val); // Ensure f32 B matches f16 B exactly
+    }
+
+    var C_f32: [M * N]f32 = undefined;
+    var C_f16: [M * N]f32 = undefined;
+
+    zblas.sgemm(M, N, K, &A, &B_f32, &C_f32, 1.0, 0.0);
+    zblas.sgemmF16(M, N, K, &A, &B_f16, &C_f16);
+
+    var max_diff: f32 = 0.0;
+    for (0..M * N) |idx| {
+        const diff = @abs(C_f32[idx] - C_f16[idx]);
+        if (diff > max_diff) max_diff = diff;
+    }
+    // Should match very closely since B values are exact in f16
+    try std.testing.expect(max_diff < 0.01);
+}
+
+test "sgemmF16General alpha/beta" {
+    const M = 4;
+    const K = 16;
+    const N = 8;
+
+    var A: [M * K]f32 = undefined;
+    var B_f16: [K * N]f16 = undefined;
+    var C_test: [M * N]f32 = undefined;
+    var C_ref: [M * N]f32 = undefined;
+
+    var rng = std.Random.DefaultPrng.init(555);
+    const random = rng.random();
+    for (&A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (&B_f16) |*v| v.* = @as(f16, @floatCast(random.float(f32) * 2.0 - 1.0));
+    for (&C_test) |*v| v.* = random.float(f32);
+    @memcpy(&C_ref, &C_test);
+
+    const alpha: f32 = 2.0;
+    const beta: f32 = 0.5;
+
+    // Reference
+    for (0..M) |i| {
+        for (0..N) |j| {
+            var sum: f32 = 0.0;
+            for (0..K) |k| {
+                sum += A[i * K + k] * @as(f32, @floatCast(B_f16[k * N + j]));
+            }
+            C_ref[i * N + j] = alpha * sum + beta * C_ref[i * N + j];
+        }
+    }
+
+    zblas.sgemmF16General(M, N, K, &A, &B_f16, &C_test, alpha, beta);
+
+    for (0..M * N) |idx| {
+        try std.testing.expectApproxEqAbs(C_ref[idx], C_test[idx], 1e-2);
+    }
+}

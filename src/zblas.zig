@@ -20,6 +20,7 @@ pub const packing = @import("util/packing.zig");
 const sgemm_impl = @import("level3/sgemm.zig");
 const sgemm_q8_impl = @import("level3/sgemm_q8.zig");
 const sgemm_q8k_impl = @import("level3/sgemm_q8k.zig");
+const sgemm_f16_impl = @import("level3/sgemm_f16.zig");
 const sgemm_bias_impl = @import("level3/sgemm_bias.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
@@ -416,6 +417,47 @@ pub fn sgemmQ8K(
     C: []f32,
 ) void {
     sgemm_q8k_impl.sgemmQ8K(M, N, K, A, B_q8k, scales, block_size, C);
+}
+
+// ============================================================================
+// F16 Weight-Only SGEMM (Half-Precision Weights, Phase 18)
+// ============================================================================
+
+/// F16 SGEMM: C = A_f32[M×K] * cast(B_f16[K×N])
+///
+/// Half-precision weight storage with full-precision compute.
+/// Weights stored as f16 (2× smaller than f32) and converted to f32
+/// on-the-fly during computation. Uses skinny-M kernel for small M
+/// (transformer inference) and KC-blocked convert for larger M.
+///
+/// Parameters:
+///   - M, N, K: dimensions (A is M×K, B is K×N, C is M×N)
+///   - A: float32 input activations
+///   - B_f16: float16 weights (row-major)
+///   - C: float32 output
+pub fn sgemmF16(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B_f16: []const f16,
+    C: []f32,
+) void {
+    sgemm_f16_impl.sgemmF16(M, N, K, A, B_f16, C);
+}
+
+/// F16 SGEMM with general alpha/beta: C = alpha * A * cast(B_f16) + beta * C
+pub fn sgemmF16General(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B_f16: []const f16,
+    C: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemm_f16_impl.sgemmF16General(M, N, K, A, B_f16, C, alpha, beta);
 }
 
 // ============================================================================
