@@ -1,5 +1,5 @@
 // zblas/tests/benchmark_cache.zig
-// Cache blocking parameter benchmark for Agent 6
+// Cache blocking parameter benchmark for
 //
 // This benchmark tests different KC (K-dimension blocking) values to find
 // optimal cache utilization. The key insight from OpenBLAS analysis:
@@ -492,7 +492,7 @@ fn benchmarkLargeMatrices() !void {
     print("\n", .{});
     print("Cache config analysis:\n", .{});
     print("  MC={}, KC={}, NC={}\n", .{ zblas.MC, zblas.KC, zblas.NC });
-    print("  Packed A size: {} KB\n", .{ zblas.MC * zblas.KC * 4 / 1024 });
-    print("  Packed B size: {} KB\n", .{ zblas.KC * zblas.NC * 4 / 1024 });
+    print("  Packed A size: {} KB\n", .{zblas.MC * zblas.KC * 4 / 1024});
+    print("  Packed B size: {} KB\n", .{zblas.KC * zblas.NC * 4 / 1024});
     print("\n", .{});
 }

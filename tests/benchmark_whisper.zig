@@ -1,5 +1,5 @@
 // zblas/tests/benchmark_whisper.zig
-// Whisper-specific benchmarks for Agent 9 Direct SIMD optimization
+// Whisper-specific benchmarks for Direct SIMD optimization
 //
 // These matrix dimensions are representative of Whisper-tiny inference workloads.
 // The goal is to match or beat the ops.zig fallback performance (~4.6s total).
