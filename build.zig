@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_benchmark.step);
 
     // ==========================================================================
-    // Whisper-specific Benchmark (Agent 9)
+    // Whisper-specific Benchmark
     // ==========================================================================
     const whisper_bench_module = b.createModule(.{
         .root_source_file = b.path("tests/benchmark_whisper.zig"),
@@ -91,7 +91,7 @@ pub fn build(b: *std.Build) void {
     whisper_bench_step.dependOn(&run_whisper_benchmark.step);
 
     // ==========================================================================
-    // Cache Blocking Benchmark (Agent 6)
+    // Cache Blocking Benchmark
     // ==========================================================================
     const cache_bench_module = b.createModule(.{
         .root_source_file = b.path("tests/benchmark_cache.zig"),
@@ -128,4 +128,34 @@ pub fn build(b: *std.Build) void {
     const run_ref_tests = b.addRunArtifact(ref_tests);
     const ref_test_step = b.step("test-ref", "Run reference correctness tests");
     ref_test_step.dependOn(&run_ref_tests.step);
+
+    // ==========================================================================
+    // Sentence Transformer Benchmark
+    // ==========================================================================
+    const st_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark_sentence_transformer.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    st_bench_module.addImport("zblas", zblas_module);
+
+    const st_benchmark = b.addExecutable(.{
+        .name = "zblas-benchmark-st",
+        .root_module = st_bench_module,
+    });
+
+    b.installArtifact(st_benchmark);
+
+    const run_st_benchmark = b.addRunArtifact(st_benchmark);
+    const st_bench_step = b.step("bench-st", "Run sentence transformer workload benchmarks");
+    st_bench_step.dependOn(&run_st_benchmark.step);
+
+    // ==========================================================================
+    // All Benchmarks (convenience target)
+    // ==========================================================================
+    const bench_all_step = b.step("bench-all", "Run all benchmarks (generic + whisper + cache + sentence-transformer)");
+    bench_all_step.dependOn(&run_benchmark.step);
+    bench_all_step.dependOn(&run_whisper_benchmark.step);
+    bench_all_step.dependOn(&run_cache_benchmark.step);
+    bench_all_step.dependOn(&run_st_benchmark.step);
 }

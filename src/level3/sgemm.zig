@@ -57,6 +57,29 @@ pub inline fn sgemm(
         return;
     }
 
+    // Skinny-M optimization: process all rows together for maximum B data reuse.
+    // When M is small (≤ SKINNY_M_THRESHOLD), the standard 4-row tiling leaves
+    // remainder rows that make separate passes over B. For M=11, this means
+    // 5 passes over B instead of 1, causing a 2.3× performance anomaly.
+    // The skinny kernel processes ALL M rows together per column chunk,
+    // loading each B vector once and reusing it for all rows.
+    //
+    // Use skinny path when:
+    // - M ≤ 4: always (tier 1 processes 24 cols, matches old 4×24 throughput)
+    // - 4 < M ≤ THRESHOLD and M%4 != 0: remainder rows cause extra B passes
+    // - M%4 == 0 and M > 4: old 4-row tiling has no remainder waste, skip skinny
+    if (M <= config.SKINNY_M_THRESHOLD) {
+        const use_skinny = (M <= 4) or (M % 4 != 0);
+        if (use_skinny) {
+            if (alpha == 1.0 and beta == 0.0) {
+                sgemmSkinnyFast(M, N, K, A, K, B, N, C, N);
+            } else {
+                sgemmSkinnyGeneral(M, N, K, A, K, B, N, C, N, alpha, beta);
+            }
+            return;
+        }
+    }
+
     // Algorithm selection based on matrix size and shape
     // Key insight from benchmarks:
     // - Direct path works well for small/medium matrices (≤512 max dim)
@@ -431,6 +454,270 @@ inline fn sgemmDirectFast(
                 c0 += A[i * lda + kk] * B[kk * ldb + j];
             }
             C[i * ldc + j] = c0;
+        }
+    }
+}
+
+// ============================================================================
+// Skinny-M SGEMM (optimized for M ≤ SKINNY_M_THRESHOLD)
+// ============================================================================
+//
+// For transformer inference, M = sequence_length (typically 8-30 tokens).
+// The standard 4-row tiling processes rows in groups of 4, but remainder
+// rows (M % 4) make separate passes over B, causing severe performance
+// degradation when B doesn't fit in L1/L2 cache.
+//
+// Example: M=11 with 4-row tiles → 2 full tiles (rows 0-7) + 3 single-row
+// passes = 5 total passes over B. For FFN shapes (11×1536×384), B=2.25MB,
+// so 5 passes = 11.25MB of L3 traffic vs. 2.25MB with single-pass skinny.
+//
+// The skinny kernel processes ALL M rows together per column chunk:
+// - One B vector load per K step, reused for all M rows
+// - Comptime-specialized for each M value → full unrolling of row loop
+// - Reduces B memory traffic by up to (M/4)× for non-multiple-of-4 M
+//
+
+/// Skinny-M fast path dispatcher: C = A * B (alpha=1.0, beta=0.0)
+fn sgemmSkinnyFast(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+) void {
+    comptime var rows: usize = 1;
+    inline while (rows <= config.SKINNY_M_THRESHOLD) : (rows += 1) {
+        if (M == rows) {
+            sgemmSkinnyFastKernel(rows, N, K, A, lda, B, ldb, C, ldc);
+            return;
+        }
+    }
+}
+
+/// Compile-time specialized skinny-M kernel for alpha=1.0, beta=0.0
+fn sgemmSkinnyFastKernel(
+    comptime ROWS: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+) void {
+    const VEC_WIDTH = comptime config.getVectorWidth();
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    var j: usize = 0;
+
+    // Tier 1: M ≤ 4 → process 3×VEC_WIDTH (24 cols) for maximum A-broadcast reuse
+    // 3×ROWS accumulators ≤ 12 → all fit in YMM registers
+    if (comptime ROWS <= 4) {
+        const NR = 3 * VEC_WIDTH;
+        while (j + NR <= N) : (j += NR) {
+            var acc0: [ROWS]Vec = undefined;
+            var acc1: [ROWS]Vec = undefined;
+            var acc2: [ROWS]Vec = undefined;
+            inline for (0..ROWS) |r| {
+                acc0[r] = @splat(0.0);
+                acc1[r] = @splat(0.0);
+                acc2[r] = @splat(0.0);
+            }
+            for (0..K) |k| {
+                const b0: Vec = B[k * ldb + j ..][0..VEC_WIDTH].*;
+                const b1: Vec = B[k * ldb + j + VEC_WIDTH ..][0..VEC_WIDTH].*;
+                const b2: Vec = B[k * ldb + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].*;
+                inline for (0..ROWS) |r| {
+                    const a: Vec = @splat(A[r * lda + k]);
+                    acc0[r] += a * b0;
+                    acc1[r] += a * b1;
+                    acc2[r] += a * b2;
+                }
+            }
+            inline for (0..ROWS) |r| {
+                C[r * ldc + j ..][0..VEC_WIDTH].* = acc0[r];
+                C[r * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = acc1[r];
+                C[r * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = acc2[r];
+            }
+        }
+    }
+
+    // Tier 2: All row counts → single VEC_WIDTH (8 cols)
+    // For M ≤ 14, all accumulators fit in YMM registers
+    while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+        var acc: [ROWS]Vec = undefined;
+        inline for (0..ROWS) |r| {
+            acc[r] = @splat(0.0);
+        }
+
+        for (0..K) |k| {
+            const b_vec: Vec = B[k * ldb + j ..][0..VEC_WIDTH].*;
+            inline for (0..ROWS) |r| {
+                acc[r] += @as(Vec, @splat(A[r * lda + k])) * b_vec;
+            }
+        }
+
+        inline for (0..ROWS) |r| {
+            C[r * ldc + j ..][0..VEC_WIDTH].* = acc[r];
+        }
+    }
+
+    // Scalar tail for remaining columns (< VEC_WIDTH)
+    while (j < N) : (j += 1) {
+        var acc: [ROWS]f32 = undefined;
+        inline for (0..ROWS) |r| {
+            acc[r] = 0.0;
+        }
+        for (0..K) |k| {
+            const b_val = B[k * ldb + j];
+            inline for (0..ROWS) |r| {
+                acc[r] += A[r * lda + k] * b_val;
+            }
+        }
+        inline for (0..ROWS) |r| {
+            C[r * ldc + j] = acc[r];
+        }
+    }
+}
+
+/// Skinny-M general path dispatcher: C = alpha * A * B + beta * C
+fn sgemmSkinnyGeneral(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    comptime var rows: usize = 1;
+    inline while (rows <= config.SKINNY_M_THRESHOLD) : (rows += 1) {
+        if (M == rows) {
+            sgemmSkinnyGeneralKernel(rows, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
+            return;
+        }
+    }
+}
+
+/// Compile-time specialized skinny-M kernel for general alpha/beta
+fn sgemmSkinnyGeneralKernel(
+    comptime ROWS: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    lda: usize,
+    B: []const f32,
+    ldb: usize,
+    C: []f32,
+    ldc: usize,
+    alpha: f32,
+    beta: f32,
+) void {
+    const VEC_WIDTH = comptime config.getVectorWidth();
+    const Vec = @Vector(VEC_WIDTH, f32);
+    const alpha_vec: Vec = @splat(alpha);
+
+    var j: usize = 0;
+
+    // Tier 1: M ≤ 4 → 3×VEC_WIDTH columns
+    if (comptime ROWS <= 4) {
+        const NR = 3 * VEC_WIDTH;
+        while (j + NR <= N) : (j += NR) {
+            var acc0: [ROWS]Vec = undefined;
+            var acc1: [ROWS]Vec = undefined;
+            var acc2: [ROWS]Vec = undefined;
+            inline for (0..ROWS) |r| {
+                acc0[r] = @splat(0.0);
+                acc1[r] = @splat(0.0);
+                acc2[r] = @splat(0.0);
+            }
+            for (0..K) |k| {
+                const b0: Vec = B[k * ldb + j ..][0..VEC_WIDTH].*;
+                const b1: Vec = B[k * ldb + j + VEC_WIDTH ..][0..VEC_WIDTH].*;
+                const b2: Vec = B[k * ldb + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].*;
+                inline for (0..ROWS) |r| {
+                    const a: Vec = @splat(A[r * lda + k]);
+                    acc0[r] += a * b0;
+                    acc1[r] += a * b1;
+                    acc2[r] += a * b2;
+                }
+            }
+            if (beta == 0.0) {
+                inline for (0..ROWS) |r| {
+                    C[r * ldc + j ..][0..VEC_WIDTH].* = acc0[r] * alpha_vec;
+                    C[r * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH].* = acc1[r] * alpha_vec;
+                    C[r * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH].* = acc2[r] * alpha_vec;
+                }
+            } else {
+                const beta_vec: Vec = @splat(beta);
+                inline for (0..ROWS) |r| {
+                    const c0 = C[r * ldc + j ..][0..VEC_WIDTH];
+                    const c1 = C[r * ldc + j + VEC_WIDTH ..][0..VEC_WIDTH];
+                    const c2 = C[r * ldc + j + 2 * VEC_WIDTH ..][0..VEC_WIDTH];
+                    c0.* = @as(Vec, c0.*) * beta_vec + acc0[r] * alpha_vec;
+                    c1.* = @as(Vec, c1.*) * beta_vec + acc1[r] * alpha_vec;
+                    c2.* = @as(Vec, c2.*) * beta_vec + acc2[r] * alpha_vec;
+                }
+            }
+        }
+    }
+
+    // Tier 2: Single VEC_WIDTH
+    while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+        var acc: [ROWS]Vec = undefined;
+        inline for (0..ROWS) |r| {
+            acc[r] = @splat(0.0);
+        }
+
+        for (0..K) |k| {
+            const b_vec: Vec = B[k * ldb + j ..][0..VEC_WIDTH].*;
+            inline for (0..ROWS) |r| {
+                acc[r] += @as(Vec, @splat(A[r * lda + k])) * b_vec;
+            }
+        }
+
+        if (beta == 0.0) {
+            inline for (0..ROWS) |r| {
+                C[r * ldc + j ..][0..VEC_WIDTH].* = acc[r] * alpha_vec;
+            }
+        } else {
+            const beta_vec: Vec = @splat(beta);
+            inline for (0..ROWS) |r| {
+                const c_ptr = C[r * ldc + j ..][0..VEC_WIDTH];
+                c_ptr.* = @as(Vec, c_ptr.*) * beta_vec + acc[r] * alpha_vec;
+            }
+        }
+    }
+
+    // Scalar tail
+    while (j < N) : (j += 1) {
+        var acc: [ROWS]f32 = undefined;
+        inline for (0..ROWS) |r| {
+            acc[r] = 0.0;
+        }
+        for (0..K) |k| {
+            const b_val = B[k * ldb + j];
+            inline for (0..ROWS) |r| {
+                acc[r] += A[r * lda + k] * b_val;
+            }
+        }
+        if (beta == 0.0) {
+            inline for (0..ROWS) |r| {
+                C[r * ldc + j] = alpha * acc[r];
+            }
+        } else {
+            inline for (0..ROWS) |r| {
+                C[r * ldc + j] = beta * C[r * ldc + j] + alpha * acc[r];
+            }
         }
     }
 }

@@ -63,6 +63,14 @@ pub fn getPackedBSize() usize {
 /// Minimum matrix size to use optimized path (smaller uses reference)
 pub const MIN_OPTIMIZED_SIZE = 32;
 
+/// Threshold for skinny-M SGEMM optimization.
+/// When M ≤ this value, a specialized kernel processes all rows together
+/// per column chunk, ensuring B is read only once per K step. This eliminates
+/// the multi-pass B reading that causes performance anomalies for M values
+/// that aren't multiples of the tile height (MR=4).
+/// Critical for transformer inference where M = sequence_length (typically 8-30).
+pub const SKINNY_M_THRESHOLD = 32;
+
 /// Alignment for packed buffers (cache line size)
 pub const CACHE_LINE_SIZE = 64;
 
