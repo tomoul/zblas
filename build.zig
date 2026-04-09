@@ -151,11 +151,33 @@ pub fn build(b: *std.Build) void {
     st_bench_step.dependOn(&run_st_benchmark.step);
 
     // ==========================================================================
+    // Q8 GEMM Benchmark
+    // ==========================================================================
+    const q8_bench_module = b.createModule(.{
+        .root_source_file = b.path("tests/benchmark_q8_gemm.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    q8_bench_module.addImport("zblas", zblas_module);
+
+    const q8_benchmark = b.addExecutable(.{
+        .name = "zblas-benchmark-q8",
+        .root_module = q8_bench_module,
+    });
+
+    b.installArtifact(q8_benchmark);
+
+    const run_q8_benchmark = b.addRunArtifact(q8_benchmark);
+    const q8_bench_step = b.step("bench-q8", "Run Q8 weight-only SGEMM benchmarks");
+    q8_bench_step.dependOn(&run_q8_benchmark.step);
+
+    // ==========================================================================
     // All Benchmarks (convenience target)
     // ==========================================================================
-    const bench_all_step = b.step("bench-all", "Run all benchmarks (generic + whisper + cache + sentence-transformer)");
+    const bench_all_step = b.step("bench-all", "Run all benchmarks (generic + whisper + cache + sentence-transformer + q8)");
     bench_all_step.dependOn(&run_benchmark.step);
     bench_all_step.dependOn(&run_whisper_benchmark.step);
     bench_all_step.dependOn(&run_cache_benchmark.step);
     bench_all_step.dependOn(&run_st_benchmark.step);
+    bench_all_step.dependOn(&run_q8_benchmark.step);
 }
