@@ -1,15 +1,48 @@
 // zblas/src/level2/sgemv.zig
 // Single-precision General Matrix-Vector Multiply (SGEMV)
 //
-// y = alpha * A * x + beta * y
-// A is [M x N], x is [N], y is [M]
+// NoTrans: y = alpha * A * x + beta * y    (A is [M×N], x is [N], y is [M])
+// Trans:   y = alpha * A^T * x + beta * y  (A is [M×N], x is [M], y is [N])
 
 const std = @import("std");
 const config = @import("../config.zig");
 const reference = @import("../reference.zig");
 
-/// SGEMV: y = alpha * A * x + beta * y
-/// A is [M x N] row-major, x is [N], y is [M]
+const Transpose = @import("../zblas.zig").Transpose;
+
+/// SGEMV: y = alpha * op(A) * x + beta * y
+/// When trans == .NoTrans: A is [M×N], x is [N], y is [M]
+/// When trans == .Trans:   A is [M×N], x is [M], y is [N]
+pub fn sgemvTrans(
+    trans: Transpose,
+    M: usize,
+    N: usize,
+    A: []const f32,
+    x: []const f32,
+    y: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    if (M == 0 or N == 0) return;
+    std.debug.assert(A.len >= M * N);
+
+    if (trans == .NoTrans) {
+        std.debug.assert(x.len >= N);
+        std.debug.assert(y.len >= M);
+        if (N < config.MIN_OPTIMIZED_SIZE) {
+            reference.sgemv_reference_simple(M, N, A, x, y, alpha, beta);
+            return;
+        }
+        sgemvOptimized(M, N, A, N, x, y, alpha, beta);
+    } else {
+        // Trans: y[j] = alpha * sum_i(A[i][j] * x[i]) + beta * y[j]
+        std.debug.assert(x.len >= M);
+        std.debug.assert(y.len >= N);
+        sgemvTransOptimized(M, N, A, N, x, y, alpha, beta);
+    }
+}
+
+/// SGEMV (NoTrans only, backwards compatible): y = alpha * A * x + beta * y
 pub fn sgemv(
     M: usize,
     N: usize,
@@ -150,6 +183,66 @@ fn sgemvOptimized(
 }
 
 // ============================================================================
+// Transpose SGEMV: y = alpha * A^T * x + beta * y
+// A is [M×N] row-major, x is [M], y is [N]
+// y[j] = alpha * sum_i(A[i*lda + j] * x[i]) + beta * y[j]
+//
+// Strategy: iterate rows of A (contiguous), scatter-add into y.
+// Each row contributes x[i] * A[i,:] to all of y.
+// ============================================================================
+
+fn sgemvTransOptimized(
+    M: usize,
+    N: usize,
+    A: []const f32,
+    lda: usize,
+    x: []const f32,
+    y: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    const VEC_WIDTH = comptime config.getVectorWidth();
+    const Vec = @Vector(VEC_WIDTH, f32);
+
+    // Scale y by beta
+    if (beta == 0.0) {
+        @memset(y[0..N], 0.0);
+    } else if (beta != 1.0) {
+        const beta_vec: Vec = @splat(beta);
+        var j: usize = 0;
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            const y_vec: Vec = y[j..][0..VEC_WIDTH].*;
+            y[j..][0..VEC_WIDTH].* = y_vec * beta_vec;
+        }
+        while (j < N) : (j += 1) {
+            y[j] *= beta;
+        }
+    }
+
+    if (alpha == 0.0) return;
+
+    // Scatter-add: for each row i, y += alpha * x[i] * A[i, :]
+    for (0..M) |i| {
+        const ax: Vec = @splat(alpha * x[i]);
+        const row_base = i * lda;
+        var j: usize = 0;
+
+        while (j + VEC_WIDTH <= N) : (j += VEC_WIDTH) {
+            const a_vec: Vec = A[row_base + j ..][0..VEC_WIDTH].*;
+            var y_vec: Vec = y[j..][0..VEC_WIDTH].*;
+            y_vec += ax * a_vec;
+            y[j..][0..VEC_WIDTH].* = y_vec;
+        }
+
+        // Scalar tail
+        const ax_scalar = alpha * x[i];
+        while (j < N) : (j += 1) {
+            y[j] += ax_scalar * A[row_base + j];
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -215,5 +308,74 @@ test "sgemv large" {
     // Compare
     for (0..M) |i| {
         try std.testing.expectApproxEqRel(y[i], y_ref[i], 1e-5);
+    }
+}
+
+test "sgemvTrans basic" {
+    // A = [1, 2, 3; 4, 5, 6] (2×3), x = [1, 2]
+    // A^T * x = [1*1+4*2, 2*1+5*2, 3*1+6*2] = [9, 12, 15]
+    const A = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const x = [_]f32{ 1, 2 };
+    var y = [_]f32{ 0, 0, 0 };
+
+    sgemvTrans(.Trans, 2, 3, &A, &x, &y, 1.0, 0.0);
+
+    try std.testing.expectApproxEqRel(y[0], 9.0, 1e-5);
+    try std.testing.expectApproxEqRel(y[1], 12.0, 1e-5);
+    try std.testing.expectApproxEqRel(y[2], 15.0, 1e-5);
+}
+
+test "sgemvTrans with alpha beta" {
+    const A = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const x = [_]f32{ 1, 2 };
+    var y = [_]f32{ 1, 1, 1 };
+
+    // y = 2.0 * A^T * x + 0.5 * y = 2*[9,12,15] + 0.5*[1,1,1] = [18.5, 24.5, 30.5]
+    sgemvTrans(.Trans, 2, 3, &A, &x, &y, 2.0, 0.5);
+
+    try std.testing.expectApproxEqRel(y[0], 18.5, 1e-5);
+    try std.testing.expectApproxEqRel(y[1], 24.5, 1e-5);
+    try std.testing.expectApproxEqRel(y[2], 30.5, 1e-5);
+}
+
+test "sgemvTrans NoTrans fallback" {
+    // sgemvTrans with NoTrans should behave like regular sgemv
+    const A = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const x = [_]f32{ 1, 2, 3 };
+    var y = [_]f32{ 0, 0 };
+
+    sgemvTrans(.NoTrans, 2, 3, &A, &x, &y, 1.0, 0.0);
+
+    try std.testing.expectApproxEqRel(y[0], 14.0, 1e-5);
+    try std.testing.expectApproxEqRel(y[1], 32.0, 1e-5);
+}
+
+test "sgemvTrans large SIMD" {
+    const M = 8;
+    const N = 384;
+    var A: [M * N]f32 = undefined;
+    var x: [M]f32 = undefined;
+    var y: [N]f32 = undefined;
+    var y_ref: [N]f32 = undefined;
+
+    for (0..M) |i| {
+        x[i] = @as(f32, @floatFromInt(i % 5)) * 0.3 - 0.6;
+        for (0..N) |j| {
+            A[i * N + j] = @as(f32, @floatFromInt((i * N + j) % 17)) * 0.1 - 0.8;
+        }
+    }
+
+    @memset(&y_ref, 0.0);
+    // Reference: y[j] = sum_i A[i][j] * x[i]
+    for (0..M) |i| {
+        for (0..N) |j| {
+            y_ref[j] += A[i * N + j] * x[i];
+        }
+    }
+
+    sgemvTrans(.Trans, M, N, &A, &x, &y, 1.0, 0.0);
+
+    for (0..N) |j| {
+        try std.testing.expectApproxEqAbs(y[j], y_ref[j], 1e-4);
     }
 }

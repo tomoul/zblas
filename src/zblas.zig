@@ -22,6 +22,7 @@ const sgemm_q8_impl = @import("level3/sgemm_q8.zig");
 const sgemm_q8k_impl = @import("level3/sgemm_q8k.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
+const level1 = @import("level1/blas_level1.zig");
 
 // ============================================================================
 // CBLAS-compatible Types
@@ -302,6 +303,23 @@ pub fn sgemv(
     sgemv_impl.sgemv(M, N, A, x, y, alpha, beta);
 }
 
+/// Single-precision Matrix-Vector multiply with transpose: y = alpha*op(A)*x + beta*y
+///
+/// When trans == .NoTrans: A is [M×N], x is [N], y is [M]
+/// When trans == .Trans:   A is [M×N], x is [M], y is [N]
+pub fn sgemvTrans(
+    trans: Transpose,
+    M: usize,
+    N: usize,
+    A: []const f32,
+    x: []const f32,
+    y: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemv_impl.sgemvTrans(trans, M, N, A, x, y, alpha, beta);
+}
+
 // ============================================================================
 // Q8 Weight-Only SGEMM (Quantized Inference)
 // ============================================================================
@@ -381,20 +399,32 @@ pub fn sgemmQ8K(
 
 /// SAXPY: y = alpha * x + y
 pub fn saxpy(n: usize, alpha: f32, x: []const f32, y: []f32) void {
-    // TODO: SIMD optimized version
-    reference.saxpy_reference(n, alpha, x, y);
+    level1.saxpy(n, alpha, x, y);
 }
 
 /// SDOT: dot product of two vectors
 pub fn sdot(n: usize, x: []const f32, y: []const f32) f32 {
-    // TODO: SIMD optimized version
-    return reference.sdot_reference(n, x, y);
+    return level1.sdot(n, x, y);
 }
 
 /// SSCAL: x = alpha * x
 pub fn sscal(n: usize, alpha: f32, x: []f32) void {
-    // TODO: SIMD optimized version
-    reference.sscal_reference(n, alpha, x);
+    level1.sscal(n, alpha, x);
+}
+
+/// SNRM2: Euclidean norm ||x||_2
+pub fn snrm2(n: usize, x: []const f32) f32 {
+    return level1.snrm2(n, x);
+}
+
+/// SCOPY: y = x
+pub fn scopy(n: usize, x: []const f32, y: []f32) void {
+    level1.scopy(n, x, y);
+}
+
+/// ISAMAX: index of element with max absolute value
+pub fn isamax(n: usize, x: []const f32) usize {
+    return level1.isamax(n, x);
 }
 
 // ============================================================================
