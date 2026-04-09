@@ -18,6 +18,8 @@ pub const packing = @import("util/packing.zig");
 
 // Import optimized implementations
 const sgemm_impl = @import("level3/sgemm.zig");
+const sgemm_q8_impl = @import("level3/sgemm_q8.zig");
+const sgemm_q8k_impl = @import("level3/sgemm_q8k.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
 
@@ -298,6 +300,79 @@ pub fn sgemv(
     beta: f32,
 ) void {
     sgemv_impl.sgemv(M, N, A, x, y, alpha, beta);
+}
+
+// ============================================================================
+// Q8 Weight-Only SGEMM (Quantized Inference)
+// ============================================================================
+
+/// Q8 SGEMM: C = A_f32[M×K] * dequant(B_q8[K×N])
+///
+/// Weight-only quantization: float32 activations × int8 weights.
+/// Dequantizes on-the-fly during computation for optimal cache usage.
+/// Uses skinny-M kernel for small M (transformer inference) and
+/// KC-blocked dequant for larger M.
+///
+/// Parameters:
+///   - M, N, K: dimensions (A is M×K, B is K×N, C is M×N)
+///   - A: float32 input activations
+///   - B_q8: int8 quantized weights (row-major)
+///   - scale: dequantization scale (w_f32 = w_i8 * scale)
+///   - C: float32 output
+pub fn sgemmQ8(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B_q8: []const i8,
+    scale: f32,
+    C: []f32,
+) void {
+    sgemm_q8_impl.sgemmQ8(M, N, K, A, B_q8, scale, C);
+}
+
+/// Q8 SGEMM with general alpha/beta: C = alpha * A * dequant(B_q8) + beta * C
+pub fn sgemmQ8General(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B_q8: []const i8,
+    scale: f32,
+    C: []f32,
+    alpha: f32,
+    beta: f32,
+) void {
+    sgemm_q8_impl.sgemmQ8General(M, N, K, A, B_q8, scale, C, alpha, beta);
+}
+
+// ============================================================================
+// Q8_K Weight-Only SGEMM (block-wise quantization, per-block scales)
+// ============================================================================
+
+/// Q8_K SGEMM: C = A_f32[M×K] * dequant(B_q8k[K×N])
+///
+/// B is int8 with per-block scales. Every `block_size` consecutive elements
+/// in the flat B array share one f32 scale.
+///
+/// Parameters:
+///   - M, N, K: dimensions (A is M×K, B is K×N, C is M×N)
+///   - A: float32 input activations
+///   - B_q8k: int8 quantized weights (row-major)
+///   - scales: per-block f32 scales, one per `block_size` elements
+///   - block_size: quantization block size (must be 32)
+///   - C: float32 output
+pub fn sgemmQ8K(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B_q8k: []const i8,
+    scales: []const f32,
+    block_size: usize,
+    C: []f32,
+) void {
+    sgemm_q8k_impl.sgemmQ8K(M, N, K, A, B_q8k, scales, block_size, C);
 }
 
 // ============================================================================
