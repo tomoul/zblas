@@ -20,9 +20,11 @@ pub const packing = @import("util/packing.zig");
 const sgemm_impl = @import("level3/sgemm.zig");
 const sgemm_q8_impl = @import("level3/sgemm_q8.zig");
 const sgemm_q8k_impl = @import("level3/sgemm_q8k.zig");
+const sgemm_bias_impl = @import("level3/sgemm_bias.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
 const level1 = @import("level1/blas_level1.zig");
+const conv1d_impl = @import("conv/conv1d.zig");
 
 // ============================================================================
 // CBLAS-compatible Types
@@ -101,6 +103,29 @@ pub fn sgemmTranspose(
     beta: f32,
 ) void {
     sgemm_impl.sgemmTranspose(transA, transB, M, N, K, A, lda, B, ldb, C, ldc, alpha, beta);
+}
+
+// ============================================================================
+// Fused SGEMM + Bias (Phase 14)
+// ============================================================================
+
+/// Fused SGEMM + bias: C = A*B + broadcast(bias)
+///
+/// Eliminates the separate bias addition pass by fusing it into the SGEMM
+/// store epilogue. bias is a [N] vector broadcast to every row of C.
+///
+/// Uses specialized skinny-M kernel for M ≤ 32 (typical for inference).
+/// Falls back to sgemm + separate bias add for larger M.
+pub fn sgemmBias(
+    M: usize,
+    N: usize,
+    K: usize,
+    A: []const f32,
+    B: []const f32,
+    bias: [*]const f32,
+    C: []f32,
+) void {
+    sgemm_bias_impl.sgemmBias(M, N, K, A, B, bias, C);
 }
 
 // ============================================================================
@@ -425,6 +450,65 @@ pub fn scopy(n: usize, x: []const f32, y: []f32) void {
 /// ISAMAX: index of element with max absolute value
 pub fn isamax(n: usize, x: []const f32) usize {
     return level1.isamax(n, x);
+}
+
+// ============================================================================
+// Conv1d (SIMD-optimized 1D Convolution)
+// ============================================================================
+
+/// Activation function for fused conv1d epilogue.
+pub const Activation = conv1d_impl.Activation;
+
+/// Repack convolution weights from standard [C_out, C_in, K] layout to
+/// SIMD-friendly [C_in, K, C_out] layout for use with conv1d/conv1dNoPad.
+pub fn conv1dRepackWeight(
+    out_channels: usize,
+    in_channels: usize,
+    kernel_size: usize,
+    src: [*]const f32,
+    dst: [*]f32,
+) void {
+    conv1d_impl.repackWeight(out_channels, in_channels, kernel_size, src, dst);
+}
+
+/// SIMD Conv1d with optional fused bias and activation.
+///
+/// Weight must be repacked via conv1dRepackWeight first.
+/// Handles arbitrary padding with bounds-checked inner loop.
+pub inline fn conv1dFull(
+    out_channels: usize,
+    in_channels: usize,
+    out_width: usize,
+    in_width: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    input: [*]const f32,
+    weight: [*]const f32,
+    bias: ?[*]const f32,
+    output: [*]f32,
+    comptime activation: Activation,
+) void {
+    conv1d_impl.conv1d(out_channels, in_channels, out_width, in_width, kernel_size, stride, padding, input, weight, bias, output, activation);
+}
+
+/// Optimized Conv1d for padding=0 (no bounds checks in inner loop).
+///
+/// Weight must be repacked via conv1dRepackWeight first.
+pub inline fn conv1dNoPad(
+    out_channels: usize,
+    in_channels: usize,
+    out_width: usize,
+    in_width: usize,
+    kernel_size: usize,
+    stride: usize,
+    input: [*]const f32,
+    weight: [*]const f32,
+    bias: ?[*]const f32,
+    output: [*]f32,
+    comptime activation: Activation,
+) void {
+    conv1d_impl.conv1dNoPad(out_channels, in_channels, out_width, in_width, kernel_size, stride, input, weight, bias, output, activation);
 }
 
 // ============================================================================
