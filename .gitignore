@@ -1,6 +1,9 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
-*md
-**/*.md
+
+# IDE
+.vscode/
+
+# Reference headers
 cblas.h
