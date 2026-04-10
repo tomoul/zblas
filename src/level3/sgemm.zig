@@ -21,7 +21,7 @@ const micro_kernel = switch (builtin.cpu.arch) {
 };
 
 // Fused kernel for x86_64 (packs B on-the-fly during computation)
-const fused_kernel_impl = @import("../kernel/x86_64/sgemm_kernel_fused.zig");
+const fused_kernel_impl = if (builtin.cpu.arch == .x86_64) @import("../kernel/x86_64/sgemm_kernel_fused.zig") else undefined;
 const has_fused_kernel = builtin.cpu.arch == .x86_64;
 
 // Fast 4x24 kernel for direct (non-packed) path on x86_64
@@ -137,7 +137,7 @@ inline fn sgemmDirect(
         return;
     }
 
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = comptime config.getVectorWidth();
     const Vec = @Vector(VEC_WIDTH, f32);
 
     // Scale C by beta first
@@ -161,9 +161,9 @@ inline fn sgemmDirect(
 
     if (alpha == 0.0) return;
 
-    // Process 4 rows at a time, 24 columns at a time (like Tomoul fallback)
+    // Process 4 rows at a time, 3*VEC_WIDTH columns at a time
     const MR = 4;
-    const NR = 24;
+    const NR = VEC_WIDTH * 3;
 
     var i: usize = 0;
     while (i + MR <= M) : (i += MR) {
@@ -328,11 +328,11 @@ inline fn sgemmDirectFast(
     C: []f32,
     ldc: usize,
 ) void {
-    const VEC_WIDTH = 8;
+    const VEC_WIDTH = comptime config.getVectorWidth();
     const Vec = @Vector(VEC_WIDTH, f32);
 
     const MR = 4;
-    const NR = 24;
+    const NR = VEC_WIDTH * 3; // 24 for x86_64 (8*3), 12 for wasm32/arm64 (4*3)
 
     var i: usize = 0;
     while (i + MR <= M) : (i += MR) {
