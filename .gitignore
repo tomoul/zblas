@@ -1,6 +1,8 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+*.a
+*.o
 
 # IDE
 .vscode/
