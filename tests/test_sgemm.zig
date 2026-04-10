@@ -693,3 +693,170 @@ test "sgemmF16General alpha/beta" {
         try std.testing.expectApproxEqAbs(C_ref[idx], C_test[idx], 1e-2);
     }
 }
+
+// ============================================================================
+// Q8K blocked path correctness (M > SKINNY_M_THRESHOLD)
+// ============================================================================
+
+test "sgemmQ8K blocked path (M=50)" {
+    const BLOCK_SIZE: usize = 32;
+    const M = 50;
+    const K = 384;
+    const N = 384;
+
+    const allocator = std.testing.allocator;
+
+    const A = try allocator.alloc(f32, M * K);
+    defer allocator.free(A);
+    const B_q8k = try allocator.alloc(i8, K * N);
+    defer allocator.free(B_q8k);
+    const num_blocks = (K * N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const block_scales = try allocator.alloc(f32, num_blocks);
+    defer allocator.free(block_scales);
+    const C_test = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_test);
+    const C_ref = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_ref);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const random = rng.random();
+    for (A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (B_q8k) |*v| v.* = @as(i8, @intCast(@as(i32, random.intRangeAtMost(i8, -127, 127))));
+    for (block_scales) |*s| s.* = random.float(f32) * 0.1;
+
+    // Reference: naive dequant + matmul
+    @memset(C_ref, 0.0);
+    for (0..M) |i| {
+        for (0..K) |k| {
+            const a_val = A[i * K + k];
+            for (0..N) |j| {
+                const w_idx = k * N + j;
+                C_ref[i * N + j] += a_val * @as(f32, @floatFromInt(B_q8k[w_idx])) * block_scales[w_idx / BLOCK_SIZE];
+            }
+        }
+    }
+
+    zblas.sgemmQ8K(M, N, K, A, B_q8k, block_scales, BLOCK_SIZE, C_test);
+
+    var max_diff: f32 = 0.0;
+    var max_idx: usize = 0;
+    for (0..M * N) |idx| {
+        const diff = @abs(C_ref[idx] - C_test[idx]);
+        if (diff > max_diff) {
+            max_diff = diff;
+            max_idx = idx;
+        }
+    }
+
+    if (max_diff >= 0.01) {
+        std.debug.print("\nBLOCKED PATH FAILURE: max_diff={d:.6} at idx={} (row={}, col={})\n", .{
+            max_diff, max_idx, max_idx / N, max_idx % N,
+        });
+        std.debug.print("  ref={d:.6} test={d:.6}\n", .{ C_ref[max_idx], C_test[max_idx] });
+    }
+
+    try std.testing.expect(max_diff < 0.01);
+}
+
+test "sgemmQ8K blocked path: FFN2 (M=60, K=1536, N=384) - 6 K-blocks" {
+    const BLOCK_SIZE: usize = 32;
+    const M = 60;
+    const K = 1536;
+    const N = 384;
+
+    const allocator = std.testing.allocator;
+
+    const A = try allocator.alloc(f32, M * K);
+    defer allocator.free(A);
+    const B_q8k = try allocator.alloc(i8, K * N);
+    defer allocator.free(B_q8k);
+    const num_blocks = (K * N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const block_scales = try allocator.alloc(f32, num_blocks);
+    defer allocator.free(block_scales);
+    const C_test = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_test);
+    const C_ref = try allocator.alloc(f32, M * N);
+    defer allocator.free(C_ref);
+
+    var rng = std.Random.DefaultPrng.init(77);
+    const random = rng.random();
+    for (A) |*v| v.* = random.float(f32) * 2.0 - 1.0;
+    for (B_q8k) |*v| v.* = @as(i8, @intCast(@as(i32, random.intRangeAtMost(i8, -127, 127))));
+    for (block_scales) |*s| s.* = random.float(f32) * 0.1;
+
+    @memset(C_ref, 0.0);
+    for (0..M) |i| {
+        for (0..K) |k| {
+            const a_val = A[i * K + k];
+            for (0..N) |j| {
+                const w_idx = k * N + j;
+                C_ref[i * N + j] += a_val * @as(f32, @floatFromInt(B_q8k[w_idx])) * block_scales[w_idx / BLOCK_SIZE];
+            }
+        }
+    }
+
+    zblas.sgemmQ8K(M, N, K, A, B_q8k, block_scales, BLOCK_SIZE, C_test);
+
+    var max_diff: f32 = 0.0;
+    for (0..M * N) |idx| {
+        const diff = @abs(C_ref[idx] - C_test[idx]);
+        if (diff > max_diff) max_diff = diff;
+    }
+
+    if (max_diff >= 0.01) {
+        std.debug.print("\nFFN2 FAILURE: max_diff={d:.6}\n", .{max_diff});
+    }
+    try std.testing.expect(max_diff < 0.01);
+}
+
+test "sgemmQ8K skinny path correctness (M=4, N=64, K=8)" {
+    const BLOCK_SIZE: usize = 32;
+    const M = 4;
+    const K = 8;
+    const N = 64;
+
+    var A: [M * K]f32 = undefined;
+    for (&A, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+    }
+    var B_q8k: [K * N]i8 = undefined;
+    for (&B_q8k, 0..) |*v, i| {
+        v.* = @as(i8, @intCast(@as(i32, @intCast(i % 11)) - 5));
+    }
+    const num_blocks = (K * N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    var block_scales: [num_blocks]f32 = undefined;
+    for (&block_scales, 0..) |*s, i| {
+        s.* = 0.03 + @as(f32, @floatFromInt(i % 5)) * 0.01;
+    }
+
+    var C_ref: [M * N]f32 = [_]f32{0.0} ** (M * N);
+    for (0..M) |i| {
+        for (0..K) |k| {
+            for (0..N) |j| {
+                const w_idx = k * N + j;
+                C_ref[i * N + j] += A[i * K + k] * @as(f32, @floatFromInt(B_q8k[w_idx])) * block_scales[w_idx / BLOCK_SIZE];
+            }
+        }
+    }
+
+    var C_test: [M * N]f32 = [_]f32{0.0} ** (M * N);
+    zblas.sgemmQ8K(M, N, K, &A, &B_q8k, &block_scales, BLOCK_SIZE, &C_test);
+
+    var max_diff: f32 = 0.0;
+    var fail_idx: usize = 0;
+    for (0..M * N) |idx| {
+        const diff = @abs(C_ref[idx] - C_test[idx]);
+        if (diff > max_diff) {
+            max_diff = diff;
+            fail_idx = idx;
+        }
+    }
+
+    if (max_diff > 1e-4) {
+        std.debug.print("\nSKINNY FAIL: max_diff={d:.6} at idx={} (row={}, col={})\n", .{
+            max_diff, fail_idx, fail_idx / N, fail_idx % N,
+        });
+        std.debug.print("  ref={d:.6} test={d:.6}\n", .{ C_ref[fail_idx], C_test[fail_idx] });
+    }
+    try std.testing.expect(max_diff < 1e-4);
+}
