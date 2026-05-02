@@ -24,6 +24,7 @@ const sgemm_f16_impl = @import("level3/sgemm_f16.zig");
 const sgemm_bias_impl = @import("level3/sgemm_bias.zig");
 const sgemm_parallel_impl = @import("level3/sgemm_parallel.zig");
 const sgemv_impl = @import("level2/sgemv.zig");
+const sgemv_q8k_impl = @import("level2/sgemv_q8k.zig");
 const level1 = @import("level1/blas_level1.zig");
 const conv1d_impl = @import("conv/conv1d.zig");
 
@@ -417,6 +418,35 @@ pub fn sgemmQ8K(
     C: []f32,
 ) void {
     sgemm_q8k_impl.sgemmQ8K(M, N, K, A, B_q8k, scales, block_size, C);
+}
+
+// ============================================================================
+// Q8_K Weight-Only SGEMV (Row-Major, Per-Block Scales)
+// ============================================================================
+
+/// Q8_K SGEMV: y[M] = A_q8k[M×N] * x[N]
+///
+/// Row-major A with per-block f32 scales. Every 32 consecutive elements
+/// in the flat A array share one f32 scale. N must be a multiple of 32.
+///
+/// For transformer inference: result[out_dim] = W_q8k[out_dim × in_dim] @ input[in_dim]
+///
+/// Parameters:
+///   - M: number of rows (output dimension)
+///   - N: number of columns (input dimension), must be multiple of 32
+///   - A_q8k: int8 quantized weight matrix (row-major)
+///   - scales: per-block f32 scales, one per 32 elements
+///   - x: float32 input vector
+///   - y: float32 output vector
+pub fn sgemvQ8K(
+    M: usize,
+    N: usize,
+    A_q8k: []const i8,
+    scales: []const f32,
+    x: []const f32,
+    y: []f32,
+) void {
+    sgemv_q8k_impl.sgemvQ8K(M, N, A_q8k, scales, x, y);
 }
 
 // ============================================================================
